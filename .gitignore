@@ -1,0 +1,6 @@
+/target
+/.cargo-home
+/.env
+/proptest-regressions/
+.DS_Store
+Thumbs.db
