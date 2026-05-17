@@ -1,6 +1,6 @@
 # OxiGate
 
-**Cloud FinOps for LLMs.** A high-performance, open-source LLM gateway written in Rust — with hard budget enforcement, cost attribution, and spend analytics built into the request path.
+**FinOps for LLMs.** A high-performance, open-source LLM gateway written in Rust — with hard budget enforcement, cost attribution, and spend analytics built into the request path.
 
 Drop-in OpenAI-compatible proxy. Route to any provider, track every dollar, enforce budgets before they blow.
 
@@ -36,9 +36,9 @@ accounting, tagging, and routing — in microseconds.
 | Provider | Chat | Streaming | Tool use | Embeddings | Cost tracking |
 |---|---|---|---|---|---|
 | OpenAI | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Anthropic | ✅ | ✅ | ✅ | — | ✅ (cache pricing) |
+| Anthropic | ✅ | ✅ | ✅ | n/a | ✅ (cache pricing) |
 | Google Gemini / Vertex | ✅ | ✅ | ✅ | ✅ | ✅ (tiered + thinking) |
-| AWS Bedrock (Converse) | ✅ | ✅ | ✅ | — | ✅ (per-region) |
+| AWS Bedrock (Converse) | ✅ | ✅ | ✅ | planned | ✅ (per-region) |
 | Azure OpenAI | ✅ | ✅ | planned | planned | ✅ |
 | OpenAI-compatible (DeepSeek, Groq, Together AI, Mistral, …) | ✅ | ✅ | varies | — | ✅ |
 
@@ -79,14 +79,21 @@ Starts the gateway, PostgreSQL, and Redis in one command.
 git clone https://github.com/getoxigate/oxigate.git
 cd oxigate
 
-# Copy the example env and add at least one provider key
+# Copy the example env (provider keys are optional — gateway starts without them
+# and returns 503 for model requests until at least one provider is configured)
 cp .env.example .env
-# edit .env — set OPENAI_API_KEY or any other provider key
+# edit .env — uncomment and set the providers you want, e.g.:
+#   OXIGATE__PROVIDERS__OPENAI__API_KEY=sk-...
 
-docker compose up -d
+# Build the image and start the full stack
+docker compose up -d --build
 ```
 
 The gateway is now listening on `http://localhost:8080`.
+
+> **Tip:** To wipe all data and start fresh (e.g. after a config change that affects the DB
+> schema), run `docker compose down -v` before `docker compose up -d --build`. The `-v` flag
+> removes the Postgres volume so migrations run from scratch.
 
 Test it:
 
@@ -94,8 +101,11 @@ Test it:
 curl http://localhost:8080/health/ready
 # {"status":"ok"}
 
+# Export the token you set as OXIGATE__AUTH__KEY in .env so curl can send it:
+export OXIGATE__AUTH__KEY=your-secret-token
+
 curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer $OXIGATE_AUTH_TOKEN" \
+  -H "Authorization: Bearer $OXIGATE__AUTH__KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o-mini",
@@ -121,14 +131,10 @@ git clone https://github.com/getoxigate/oxigate.git
 cd oxigate
 
 cp .env.example .env
-# edit .env
+# edit .env — set provider keys; DB/Redis URLs default to localhost (see config/oxigate.yaml)
 
-# Run database migrations
-export DATABASE_URL="postgres://oxigate:secret@localhost:5432/oxigate"
-cargo run --bin oxigate -- migrate
-
-# Start the gateway
-cargo run --release --bin oxigate -- start --config config/oxigate.yaml
+# Start the gateway — database migrations run automatically on startup
+cargo run --release --bin oxigate -- --config config/oxigate.yaml
 ```
 
 ---
@@ -142,7 +148,7 @@ server:
   port: 8080
 
 auth:
-  bearer_token: "your-secret-token"   # or set OXIGATE__AUTH__BEARER_TOKEN
+  key: "your-secret-token"            # or set OXIGATE__AUTH__KEY
 
 providers:
   openai:
@@ -155,6 +161,14 @@ budget:
 
 See [`config/oxigate.yaml`](config/oxigate.yaml) for the full annotated reference and
 [`docs/`](docs/) for provider-specific guides.
+
+---
+
+## Community and safety
+
+Contribution workflow and the Contributor License Agreement (CLA) process are documented in [`CONTRIBUTING.md`](CONTRIBUTING.md). Report vulnerabilities privately using [`SECURITY.md`](SECURITY.md) — please do **not** file security reports as public GitHub issues.
+
+Operational smoke checks (`docker compose`, local `cargo`, live provider spot tests) live in [`docs/smoke-tests.md`](docs/smoke-tests.md).
 
 ---
 

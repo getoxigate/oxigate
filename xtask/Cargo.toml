@@ -1,0 +1,8 @@
+[package]
+name    = "xtask"
+version = "0.1.0"
+edition = "2024"
+publish = false          # never published to crates.io
+
+[dependencies]
+anyhow = "1"             # acceptable: xtask is a binary tool, not library code

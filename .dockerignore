@@ -1,0 +1,10 @@
+target/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+.git/
+docs/
+benches/

@@ -1,0 +1,171 @@
+[workspace]
+members = [".", "xtask"]
+resolver = "2"
+
+[package]
+name = "oxigate"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Open-core LLM FinOps gateway"
+repository = "https://github.com/getoxigate/oxigate"
+homepage = "https://www.oxigate.com"
+
+[features]
+default = []
+# Exposes test-only utilities (e.g. build_frame) to integration test crates via pub #[cfg(feature)].
+testing = []
+# Clock override for integration tests only. Release builds with this feature fail at compile time (see lib.rs).
+# Implies `testing` so integration tests can use build_frame without a separate --features flag.
+test-hooks = ["testing"]
+pro = [
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+]
+enterprise = ["pro"]
+python-bridge = ["dep:pyo3"]
+wasm-plugins = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server and middleware
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "limit"] }
+hyper = { version = "1", features = ["full"] }
+
+# Outbound HTTP to LLM providers
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Configuration (env > YAML > defaults)
+figment = { version = "0.10", features = ["yaml", "env", "test"] }
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# Error handling
+thiserror = "2"
+miette = { version = "7", features = ["fancy"] }
+
+# Secrets (zeroization on drop)
+secrecy = { version = "0.8", features = ["serde"] }
+
+# Constant-time comparisons (Bearer token auth; prevents timing attacks)
+subtle = "2"
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+tokio-stream = "0.1"
+
+# Tracing and structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics facade + Community exporter
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+# Database
+sqlx = { version = "0.8", features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+    "chrono",
+    "uuid",
+    "json",
+    "migrate",
+] }
+
+# Redis pooling. Use 0.27 to match deadpool-redis 0.18.
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+deadpool-redis = { version = "0.18", features = ["rt_tokio_1"] }
+
+# Shared types
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.9", features = ["serde"] }
+
+# Bitflags for model metadata
+bitflags = "2"
+
+# JWT for Vertex AI OAuth
+jsonwebtoken = "9"
+tokio-util = { version = "0.7", features = ["io"] }
+
+# AWS Bedrock adapter: SigV4 signing + EventStream frame parsing
+aws-sigv4 = "1"
+aws-credential-types = "1"
+aws-smithy-eventstream = "0.60"
+aws-smithy-types = "1"
+
+# Pro-tier OTLP export (optional - compiled only with `pro` or `enterprise` feature)
+tracing-opentelemetry = { version = "0.27", optional = true }
+opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", optional = true, features = ["http-proto"] }
+
+# Python bridge (optional - compiled only with `python-bridge` feature)
+pyo3 = { version = "0.24", optional = true }
+
+# Routing / load-balancing strategies
+weighted_rand = "0.4"
+rand = "0.8"
+http-body = "1"
+
+[dev-dependencies]
+async-stream = "0.3" # streaming upstream mock in integration tests
+axum = { version = "0.8", features = ["macros"] }
+bytes = "1"
+tokio = { version = "1", features = ["test-util"] }  # pause/advance for concurrency tests
+deadpool = "0.12"  # for TimeoutType in redis PoolError unit test
+tracing-test = "0.2"  # for capturing tracing events in unit tests
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }
+axum-test = "17"
+wiremock = "0.6"
+tempfile = "3"
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+rsa = { version = "0.9", features = ["pem"] }
+
+[package.metadata.cargo-machete]
+ignored = [
+    "chrono",
+    "hyper",
+    "metrics-exporter-prometheus",
+    "opentelemetry",
+    "opentelemetry-otlp",
+    "opentelemetry_sdk",
+    "pyo3",
+    "tower",
+    "tower-http",
+    "tracing-opentelemetry",
+]
+
+[[bin]]
+name = "oxigate"
+path = "src/bin/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+# Integration tests require `test-hooks` so `ProviderHealthTracker::new_for_test` is visible.
+# Run with: cargo test --all-features  (or: cargo xtask check)
+required-features = ["test-hooks"]
+
+[[test]]
+name = "unit"
+path = "tests/unit/mod.rs"
+
+[[bench]]
+name = "routing"
+path = "benches/routing.rs"
+harness = false

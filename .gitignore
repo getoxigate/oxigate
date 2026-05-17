@@ -1,6 +1,23 @@
+# Never nest a Git metadata directory inside this tree (broken tooling / accidental exports).
+.git/
+
 /target
 /.cargo-home
 /.env
 /proptest-regressions/
 .DS_Store
 Thumbs.db
+
+# IDE / editor / AI agent tooling (local config — never commit)
+.vscode/
+.idea/
+.claude/
+.cursor/
+.cursorrules
+.codex/
+
+# lefthook local overrides
+lefthook-local.yml
+
+# logs
+*.log

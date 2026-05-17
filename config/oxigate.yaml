@@ -1,0 +1,105 @@
+# OxiGate configuration — Community Edition
+# Precedence: env vars > this file > code defaults
+# Env var format: OXIGATE__<SECTION>__<KEY>
+# Example: OXIGATE__SERVER__PORT=9090 overrides server.port below.
+
+server:
+  port: 8080                 # Class C — restart required to change
+  host: "0.0.0.0"            # Class C — restart required to change
+  drain_timeout_secs: 30     # Class A — hot-reloadable
+
+database:
+  url: "postgres://oxigate:changeme@localhost:5432/oxigate"  # Class B — pool rebuild (matches docker-compose)
+  max_connections: 10        # Class B — pool rebuild
+  pool_acquire_timeout_secs: 30   # Class B — pool rebuild. Seconds to wait when acquiring from pool (not TCP connect). Env: OXIGATE__DATABASE__POOL_ACQUIRE_TIMEOUT_SECS
+
+redis:
+  url: "redis://localhost:6379"     # Class B — pool rebuild
+  pool_size: 16                     # Class B — pool rebuild
+  pool_timeout_secs: 5              # Class B — pool rebuild. Seconds to wait for a free connection.
+
+log_level: "info"            # Class A — hot-reloadable. Values: trace|debug|info|warn|error
+
+# Provider adapters. When configured, ProviderRouter dispatches by model name.
+# providers:
+#   openai_compat:                # OpenAI-compatible providers (DeepSeek, OpenRouter, Kimi, etc.). See docs/providers/openai-compat.md.
+#     - name: deepseek
+#       base_url: "https://api.deepseek.com"
+#       api_key: "${DEEPSEEK_KEY}"
+#     - name: openrouter
+#       base_url: "https://openrouter.ai/api"   # adapter appends /v1/chat/completions
+#       api_key: "${OPENROUTER_KEY}"
+#       stream_options_support: true   # OpenRouter supports stream_options for usage tracking
+#   anthropic:
+#     api_key: "sk-ant-..."             # Required. Class A hot-reload.
+#     default_model: "claude-sonnet-4-6"  # Optional. Class A.
+#     default_max_tokens: 4096           # Required by Anthropic when request omits max_tokens. Class A.
+#     api_base_url: "https://api.anthropic.com"    # Optional. Class B.
+#     anthropic_version: "2023-06-01"    # Optional. Class B.
+#     timeout_secs: 120                  # Optional. Class B.
+#   openai:
+#     api_key: "sk-..."              # Required. Class A hot-reload.
+#     default_model: "gpt-4o"        # Optional. Class A.
+#     api_base_url: "https://api.openai.com"  # Optional; override for vLLM, Ollama. Class B.
+#     timeout_secs: 120              # Optional. Class B.
+#     organization: "org-xxx"        # Optional. OpenAI-Organization header. Class B.
+#     project: "proj-xxx"            # Optional. OpenAI-Project header. Class B.
+#   gemini:
+#     mode: api                    # "api" = Gemini Developer API, "vertex" = Vertex AI. Class B reload.
+#     api_key: "your-gemini-key"   # Required when mode=api. Class A hot-reload.
+#     default_model: "gemini-2.5-flash"
+#     timeout_secs: 120
+#   # Vertex AI example:
+#   gemini:
+#     mode: vertex
+#     vertex_project: "my-gcp-project"
+#     vertex_location: "us-central1"
+#     vertex_service_account_json: "{\"type\":\"service_account\",...}"  # Inline JSON or path. Class B.
+# budgets: {}                 # Populated by (FinOps budget enforcement)
+
+# Retry and fallback resilience.
+# retry:
+#   max_retries: 3                # Attempts per provider before fallback. Default: 3.
+#   base_delay_ms: 100            # Base exponential backoff delay. Default: 100 ms.
+#   multiplier: 2.0               # Backoff multiplier per retry. Default: 2.0.
+#   max_delay_ms: 10000           # Cap on backoff delay. Default: 10 000 ms.
+#   jitter_ms: 100                # Uniform random jitter added to each delay. Default: 100 ms.
+#   stream_chunk_timeout_ms: 30000 # Inter-chunk timeout for streaming responses. Default: 30 000 ms.
+
+# Fallback rules: when provider A exhausts retries, cascade to provider B.
+# The best-matching rule fires (most specific provider+model wins).
+# fallbacks:
+#   - provider: anthropic         # Match requests dispatched via anthropic.
+#     targets:
+#       - provider: openai        # Short form: preserve original request model.
+#       # Or with explicit model override:
+#       # - { provider: openai, model: gpt-4o-mini }
+#   - model: "claude-*"          # Match by model glob (no provider constraint).
+#     targets:
+#       - provider: openai
+
+# LiteLLM proxy — point the OpenAI adapter at a running LiteLLM instance to access any
+# LiteLLM-supported provider without additional Rust code (see docs/smoke-tests.md §16).
+# Run: litellm --model groq/llama-3.1-8b-instant --port 4000
+# providers:
+#   openai:
+#     api_key: "any-string"           # LiteLLM proxy does not validate the key
+#     api_base_url: "http://localhost:4000"
+
+# AWS Bedrock adapter — Converse API; Claude 3+ family (anthropic.*) in phase 1.
+# Credentials: set access_key_id/secret_access_key here OR via env vars
+# (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN).
+# providers:
+#   bedrock:
+#     region: "us-east-1"
+#     # access_key_id: "AKIA..."         # Optional: explicit creds (prefer env vars for security)
+#     # secret_access_key: "..."         # Optional: explicit creds
+#     # session_token: "..."             # Optional: only for temporary STS credentials
+#     default_model: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+#     timeout_secs: 120
+#     # endpoint_url: "https://..."      # Optional: VPC endpoint or test mock override
+
+# Security and visibility settings.
+# security:
+#   expose_provider_names: false  # Set true to inject X-Oxigate-Attempted-Providers/Models headers.
+#                                 # Default: false (hides internal routing topology from callers).

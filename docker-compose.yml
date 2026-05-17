@@ -1,0 +1,62 @@
+services:
+  gateway:
+    build: .
+    restart: on-failure
+    ports:
+      - "8080:8080"
+    networks:
+      - oxigate
+    env_file:
+      - path: .env
+        required: false   # start without .env in CI or when no providers needed
+    environment:
+      # Hard overrides — always win over .env and shell
+      OXIGATE__DATABASE__URL: "postgres://oxigate:changeme@postgres:5432/oxigate"
+      OXIGATE__REDIS__URL:    "redis://redis:6379"
+      OXIGATE__LOG_LEVEL:     "info"
+      # Auth and provider keys go in .env (see .env.example).
+      # Never add `VAR: ${VAR:-}` here for optional provider sections — an empty
+      # string is still set and causes figment validation failure for that provider.
+    volumes:
+      - ./config/oxigate.yaml:/etc/oxigate/oxigate.yaml:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Gateway serves GET /health/ready. Distroless has no wget/curl/shell — no in-container
+    # HTTP health probe here unless you extend the Dockerfile. depends_on waits for Postgres
+    # and Redis to be ping-ready before gateway starts.
+
+  postgres:
+    image: postgres:16-alpine
+    networks:
+      - oxigate
+    ports:
+      - "5432:5432"   # host access for sqlx prepare, pg clients
+    environment:
+      POSTGRES_DB:       oxigate
+      POSTGRES_USER:     oxigate
+      POSTGRES_PASSWORD: changeme
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U oxigate"]
+      interval: 5s
+      retries:  5
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - oxigate
+    ports:
+      - "6379:6379"   # host access for redis-cli, local dev
+    healthcheck:
+      test:     ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries:  5
+
+networks:
+  oxigate:
+    driver: bridge
+
+volumes:
+  pgdata:
