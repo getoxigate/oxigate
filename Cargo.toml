@@ -67,7 +67,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics facade + Community exporter
 metrics = "0.23"
-metrics-exporter-prometheus = "0.15"
+metrics-exporter-prometheus = "0.18"
 
 # Database
 sqlx = { version = "0.8", features = [
