@@ -6,7 +6,7 @@
 
 mod auth;
 mod budget_e2e;
-#[cfg(all(feature = "pro", feature = "test-hooks"))]
+#[cfg(feature = "test-hooks")]
 mod budget_period_reset;
 mod chat_completions_e2e;
 #[path = "../common/mod.rs"]

@@ -4,6 +4,9 @@
 compile_error!("feature `test-hooks` is for debug tests only; do not enable it in release builds");
 
 pub mod api;
+pub mod cli;
+pub mod gateway;
+pub use gateway::{Gateway, GatewayResources};
 pub mod config;
 pub mod db;
 pub mod domain;

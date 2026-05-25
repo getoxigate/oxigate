@@ -100,7 +100,7 @@ impl BudgetRuntimeConfig {
         }
     }
 
-    pub(crate) fn resolved_now(&self) -> chrono::DateTime<chrono::Utc> {
+    pub fn resolved_now(&self) -> chrono::DateTime<chrono::Utc> {
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(t) = self.now_override {
             return t;

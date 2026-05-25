@@ -18,17 +18,13 @@ testing = []
 # Clock override for integration tests only. Release builds with this feature fail at compile time (see lib.rs).
 # Implies `testing` so integration tests can use build_frame without a separate --features flag.
 test-hooks = ["testing"]
-pro = [
-    "dep:tracing-opentelemetry",
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-]
-enterprise = ["pro"]
 python-bridge = ["dep:pyo3"]
 wasm-plugins = []
 
 [dependencies]
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -106,12 +102,6 @@ aws-credential-types = "1"
 aws-smithy-eventstream = "0.60"
 aws-smithy-types = "1"
 
-# Pro-tier OTLP export (optional - compiled only with `pro` or `enterprise` feature)
-tracing-opentelemetry = { version = "0.27", optional = true }
-opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", optional = true, features = ["http-proto"] }
-
 # Python bridge (optional - compiled only with `python-bridge` feature)
 pyo3 = { version = "0.24", optional = true }
 
@@ -141,13 +131,9 @@ ignored = [
     "chrono",
     "hyper",
     "metrics-exporter-prometheus",
-    "opentelemetry",
-    "opentelemetry-otlp",
-    "opentelemetry_sdk",
     "pyo3",
     "tower",
     "tower-http",
-    "tracing-opentelemetry",
 ]
 
 [[bin]]

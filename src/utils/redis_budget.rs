@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 OxiGate contributors
-//! Shared Redis spend-read helper for Pro budget middleware.
+//! Shared Redis spend-read helper used by [`BudgetLayer`] and [`HardCapLayer`].
 //!
 //! Extracted to eliminate the duplicated `get_spend_nano_usd` in `BudgetLayer` and
 //! `HardCapLayer`. Both layers call this with a caller-specific `skip_event` so that
 //! structured log events remain distinguishable in ops tooling.
 //!
-//! Gated under `#[cfg(feature = "pro")]` via `utils/mod.rs` — not compiled for Community.
+//! Compiled for Community alongside `BudgetLayer` and `HardCapLayer`.
 
 use std::sync::Arc;
 

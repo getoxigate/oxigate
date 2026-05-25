@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-#[cfg(all(feature = "pro", feature = "test-hooks"))]
+#[cfg(feature = "test-hooks")]
 use chrono::{DateTime, Utc};
 use oxigate::api::{AppState, router, router_with_body_limit};
 use oxigate::config::{AuthConfig, BudgetConfig, PricingConfig, SecurityConfig};
@@ -163,7 +163,7 @@ impl TestGateway {
 
     /// Like [`Self::spawn_with_budget`], but returns shared [`BudgetRuntimeConfig`] for
     /// `test-hooks` clock injection (`now_override`).
-    #[cfg(all(feature = "pro", feature = "test-hooks"))]
+    #[cfg(feature = "test-hooks")]
     pub async fn spawn_with_budget_and_clock(
         pool: DbPool,
         redis: RedisPool,

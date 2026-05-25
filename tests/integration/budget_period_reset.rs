@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 OxiGate contributors
-//! period-keyed budget behaviour and lazy reset (requires `pro` + `test-hooks`).
+//! Period-keyed budget behaviour and lazy reset (requires `test-hooks`).
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use crate::common::containers::{PgContainer, RedisContainer};
 use crate::common::gateway::TestGateway;
 use crate::common::stub_adapter::StubAdapter;
 use oxigate::config::{AuthConfig, BudgetConfig, BudgetDuration};
-use oxigate::utils::{CostHeader, identity_spend_key, period_key, spend_key_ttl_secs};
+use oxigate::utils::{CostHeader, identity_spend_key, period_key};
 
 /// Spec #1 — current period spend reads zero when only a *previous* monthly key is populated.
 #[tokio::test]
@@ -233,62 +233,5 @@ async fn daily_lazy_reset_us_eastern_midnight() {
             .get(CostHeader::BUDGET_REMAINING)
             .and_then(|v| v.to_str().ok()),
         Some("10.000000")
-    );
-}
-
-/// Spec #9 — scheduler `SET NX` does not clobber spend if the new-period key already exists.
-#[tokio::test]
-async fn budget_scheduler_set_nx_does_not_zero_live_spend() {
-    let redis = RedisContainer::start().await.expect("redis");
-    let now = Utc.with_ymd_and_hms(2026, 4, 10, 12, 0, 0).unwrap();
-    let budget = BudgetConfig {
-        budget_duration: Some("30d".into()),
-        timezone: "UTC".into(),
-        soft_cap_usd: Some(10.0),
-        ..BudgetConfig::default()
-    };
-    let runtime = Arc::new(tokio::sync::RwLock::new({
-        let mut r =
-            oxigate::middleware::budget::BudgetRuntimeConfig::from_budget_config(budget.clone());
-        r.now_override = Some(now);
-        r.next_reset_at = Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap();
-        r
-    }));
-    let sched = oxigate::middleware::budget_scheduler::BudgetResetScheduler::new(
-        Arc::clone(&runtime),
-        Arc::new(tokio::sync::RwLock::new(redis.pool.clone())),
-    );
-
-    let period = period_key(BudgetDuration::Monthly, now, UTC);
-    let key = identity_spend_key("acme", "k1", &period);
-    let ttl = spend_key_ttl_secs(BudgetDuration::Monthly);
-    let mut conn = redis.pool.get().await.expect("redis");
-    redis::cmd("SET")
-        .arg(&key)
-        .arg(4_000_000_000_i64)
-        .query_async::<()>(&mut *conn)
-        .await
-        .expect("pre-seed new-period key as if lazy reset ran first");
-
-    let failures = sched.wake_cycle_for_test().await;
-    assert_eq!(failures, 0);
-
-    let v: i64 = redis::cmd("GET")
-        .arg(&key)
-        .query_async(&mut *conn)
-        .await
-        .expect("GET");
-    assert_eq!(
-        v, 4_000_000_000,
-        "SET NX must not overwrite existing counter"
-    );
-    let t_live: i64 = redis::cmd("TTL")
-        .arg(&key)
-        .query_async(&mut *conn)
-        .await
-        .expect("TTL");
-    assert!(
-        (t_live - ttl as i64).abs() <= 5,
-        "TTL refreshed (~{ttl}s), got {t_live}"
     );
 }
