@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # The tag names the release, but the binary reports the Cargo.toml version.
       # If those disagree the image is mislabelled and bug reports land against
