@@ -93,7 +93,7 @@ chrono-tz = { version = "0.9", features = ["serde"] }
 bitflags = "2"
 
 # JWT for Vertex AI OAuth
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 tokio-util = { version = "0.7", features = ["io"] }
 
 # AWS Bedrock adapter: SigV4 signing + EventStream frame parsing
