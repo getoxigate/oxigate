@@ -84,15 +84,18 @@ async fn stream_inter_chunk_timeout_emits_error_event() {
     });
 
     // Build the real adapter pointed at the mock upstream.
-    let adapter = OpenAiAdapter::new(OpenAIConfig {
-        api_key: Some(SecretString::new("sk-test")),
-        default_model: Some("gpt-4o".into()),
-        api_base_url: Some(base_url.trim_end_matches('/').to_string()),
-        timeout_secs: Some(30),
-        supported_models: None,
-        organization: None,
-        project: None,
-    })
+    let adapter = OpenAiAdapter::new(
+        OpenAIConfig {
+            api_key: Some(SecretString::new("sk-test")),
+            default_model: Some("gpt-4o".into()),
+            api_base_url: Some(base_url.trim_end_matches('/').to_string()),
+            timeout_secs: Some(30),
+            supported_models: None,
+            organization: None,
+            project: None,
+        },
+        crate::common::bundled_pricing_holder(),
+    )
     .await
     .expect("OpenAI adapter must build");
 

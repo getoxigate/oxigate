@@ -15,6 +15,7 @@ pub mod eventstream;
 pub mod signing;
 pub mod translate;
 
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -29,6 +30,8 @@ use crate::domain::ports::{
     ChatCompletionStream, HealthStatus, ProviderAdapter, ProviderAdapterExt, ProviderError,
     ProviderKind, ProviderMetadata,
 };
+use crate::domain::pricing::{PricingDb, snapshot_pricing_context};
+use crate::domain::usage_accounting::PricingContext;
 use crate::providers::tool_limits::FEATURE_BEDROCK_STREAMING_TOOL_USE;
 use crate::utils::provider_error::classify_reqwest_error;
 use crate::utils::sse::openai_chat_completion_envelope;
@@ -36,7 +39,8 @@ use crate::utils::sse::openai_chat_completion_envelope;
 use self::eventstream::{ConverseEvent, EventStreamParser};
 use self::signing::BedrockSigner;
 use self::translate::{
-    ConverseResponse, chat_request_to_converse, converse_response_to_chat, map_stop_reason,
+    BEDROCK_ACCOUNTING, ConverseResponse, chat_request_to_converse, converse_cache_write,
+    converse_response_to_chat, map_stop_reason,
 };
 
 const DEFAULT_MODEL: &str = "anthropic.claude-3-5-sonnet-20241022-v2:0";
@@ -62,10 +66,21 @@ pub struct BedrockAdapter {
     metadata: ProviderMetadata,
     signer: BedrockSigner,
     base_url: String,
+    /// Hot-reload pricing holder. Both the buffered and the streaming path clone one generation
+    /// out of it before dispatch, so the cache-write class registry a response is accounted
+    /// against and the rates it is priced with come from the same pricing database.
+    pricing_db: Arc<RwLock<PricingDb>>,
 }
 
 impl BedrockAdapter {
-    pub async fn new(config: BedrockConfig) -> Result<Self, ProviderError> {
+    /// Creates a Bedrock adapter. Config must be validated by GatewayConfig::validate.
+    ///
+    /// `pricing_db` is the same hot-reload holder the cost calculator reads; the adapter needs it
+    /// to snapshot one pricing generation per buffered request before dispatch.
+    pub async fn new(
+        config: BedrockConfig,
+        pricing_db: Arc<RwLock<PricingDb>>,
+    ) -> Result<Self, ProviderError> {
         if config.region.trim().is_empty() {
             return Err(ProviderError::InvalidRequest(
                 "providers.bedrock.region is required".into(),
@@ -123,7 +138,18 @@ impl BedrockAdapter {
             metadata,
             signer,
             base_url,
+            pricing_db,
         })
+    }
+
+    /// Snapshots this request's pricing generation.
+    ///
+    /// Called once per request, before the upstream request is dispatched: a request dispatched
+    /// under one database but completing after a reload must not be accounted against one
+    /// generation's class registry and billed at another's rates. Both the buffered and the
+    /// streaming path call this.
+    fn pricing_context(&self) -> PricingContext {
+        snapshot_pricing_context(&self.pricing_db)
     }
 
     /// Returns the effective model ID (uses default if request is empty).
@@ -318,6 +344,10 @@ impl ProviderAdapter for BedrockAdapter {
         let body = self.build_body(req)?;
         let url = self.converse_url(&model);
 
+        // Snapshotted before dispatch: a reload landing while the request is in flight must not
+        // change the registry it is accounted against or the rates it is priced with.
+        let pricing_context = self.pricing_context();
+
         let signed_headers = self.signer.sign_request("POST", &url, &body)?;
 
         let start = Instant::now();
@@ -344,6 +374,7 @@ impl ProviderAdapter for BedrockAdapter {
             &converse_resp,
             &model,
             request_id,
+            &pricing_context,
         ))
     }
 
@@ -366,6 +397,11 @@ impl ProviderAdapter for BedrockAdapter {
         info!(model = %model, request_id = %request_id, "bedrock: chat_completion_stream");
         let body = self.build_body(req)?;
         let url = self.converse_stream_url(&model);
+
+        // Snapshotted before dispatch, exactly as the buffered path does: a reload landing while
+        // the request is in flight must not change the registry the terminal metadata frame is
+        // accounted against or the rates it is priced with.
+        let pricing_context = self.pricing_context();
 
         let signed_headers = self.signer.sign_request("POST", &url, &body)?;
 
@@ -460,11 +496,28 @@ impl ProviderAdapter for BedrockAdapter {
                         ConverseEvent::MessageStop { stop_reason } => {
                             pending_stop_reason = Some(stop_reason);
                         }
-                        ConverseEvent::Metadata { input_tokens, output_tokens } => {
+                        ConverseEvent::Metadata {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_input_tokens,
+                            cache_write_input_tokens,
+                            cache_details,
+                        } => {
+                            let cache_write = converse_cache_write(
+                                cache_write_input_tokens,
+                                &cache_details,
+                                &pricing_context,
+                            );
                             let usage = Usage {
                                 prompt_tokens: input_tokens,
                                 completion_tokens: output_tokens,
+                                // Deliberately excludes both cache buckets, matching the buffered
+                                // path and the sibling Additive lane.
                                 total_tokens: input_tokens + output_tokens,
+                                cache_creation_input_tokens: cache_write.published_tokens(),
+                                cache_read_input_tokens,
+                                accounting: BEDROCK_ACCOUNTING,
+                                cache_write,
                                 ..Default::default()
                             };
                             // take() clears pending_stop_reason so the post-loop fallback
@@ -495,7 +548,12 @@ impl ProviderAdapter for BedrockAdapter {
                                 Ok(b) => b,
                                 Err(e) => { yield Err(e); return; }
                             };
-                            yield Ok(StreamChunk::new(data, Some(usage), Some(model_clone.clone())));
+                            // The metadata frame is the last thing a completed Converse stream
+                            // sends, and `sse_frame(.., true)` closes with the terminator.
+                            yield Ok(StreamChunk {
+                                is_final: true,
+                                ..StreamChunk::new(data, Some(usage), Some(model_clone.clone()))
+                            });
                             break 'outer;
                         }
                         ConverseEvent::StreamError(e) => {
@@ -508,7 +566,9 @@ impl ProviderAdapter for BedrockAdapter {
             }
 
             // Fallback: stream ended after messageStop but without a metadata frame.
-            // Rare (error paths), but we must still close the stream.
+            //
+            // Reached only on clean exhaustion — every failure above returns before here — so the
+            // terminator it emits closes a completed response that simply reported no usage.
             if let Some(stop_reason) = pending_stop_reason {
                 let finish = map_stop_reason(&stop_reason);
                 let choice = serde_json::json!({
@@ -524,7 +584,10 @@ impl ProviderAdapter for BedrockAdapter {
                 );
                 match sse_frame(&envelope, true) {
                     Ok(data) => {
-                        yield Ok(StreamChunk::new(data, None, Some(model_clone.clone())));
+                        yield Ok(StreamChunk {
+                            is_final: true,
+                            ..StreamChunk::new(data, None, Some(model_clone.clone()))
+                        });
                     }
                     Err(e) => {
                         yield Err(e);
@@ -556,6 +619,16 @@ impl ProviderAdapterExt for BedrockAdapter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pricing_holder() -> Arc<RwLock<PricingDb>> {
+        Arc::new(RwLock::new(
+            PricingDb::load(
+                crate::domain::pricing::BUNDLED_PRICING_JSON,
+                &crate::config::PricingConfig::default(),
+            )
+            .expect("bundled pricing must load"),
+        ))
+    }
 
     fn make_config(region: &str) -> BedrockConfig {
         BedrockConfig {
@@ -617,6 +690,7 @@ mod tests {
                 "us-east-1".into(),
             ),
             base_url: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            pricing_db: test_pricing_holder(),
         };
         let err = adapter.check_model_prefix("meta.llama3-70b-instruct-v1:0");
         assert!(matches!(err, Err(ProviderError::UnknownModel(_))));
@@ -645,6 +719,7 @@ mod tests {
                 "us-east-1".into(),
             ),
             base_url: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            pricing_db: test_pricing_holder(),
         };
         // '/' path traversal
         assert!(matches!(

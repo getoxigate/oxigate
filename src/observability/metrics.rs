@@ -65,6 +65,27 @@ pub const EMBEDDINGS_TOTAL: &str = "oxigate_embeddings_total";
 /// Histogram: embedding request latency in seconds, scoped to /v1/embeddings.
 pub const EMBEDDINGS_DURATION_SECONDS: &str = "oxigate_embeddings_duration_seconds";
 
+// --- provider usage normalization metrics ---
+
+/// Counter: incremented once per provider usage payload whose own reported numbers contradict
+/// the accounting the provider contract declares — a cached-token count larger than the prompt
+/// it is documented to be part of, or a reasoning count larger than the completion total it is
+/// documented to sit inside.
+///
+/// This means "the provider's own numbers do not add up". It is deliberately distinct from a
+/// counter for tokens we can see but have no rate for, and from one for tokens priced by policy
+/// because the provider left them unclassified.
+///
+/// Label: `kind` — snake_case invariant name, drawn from the closed set of
+/// `INVARIANT_*` constants below.
+pub const USAGE_INVARIANT_VIOLATION_TOTAL: &str = "oxigate_usage_invariant_violation_total";
+
+/// `kind` label: cache tokens exceed the prompt total that is documented to contain them.
+pub const INVARIANT_CACHE_EXCEEDS_PROMPT: &str = "cache_exceeds_prompt";
+
+/// `kind` label: reasoning tokens exceed the completion total that is documented to contain them.
+pub const INVARIANT_REASONING_EXCEEDS_COMPLETION: &str = "reasoning_exceeds_completion";
+
 /// Counter: cumulative embedding vectors returned. Monotonically increasing — use
 /// .increment(n), not .record(). Not a distribution.
 pub const EMBEDDINGS_VECTORS_TOTAL: &str = "oxigate_embeddings_vectors_total";
@@ -121,6 +142,15 @@ pub fn record_skip(reason: &str) {
     metrics::counter!(FALLBACK_SKIP_TOTAL, "reason" => reason.to_owned()).increment(1);
 }
 
+/// Records one provider-usage invariant violation.
+///
+/// `kind` must be one of the `INVARIANT_*` constants — a closed set, so the label stays
+/// low-cardinality. Detection happens where the usage is normalized; emission happens here,
+/// because direct metric macros are confined to this module.
+pub fn record_usage_invariant_violation(kind: &'static str) {
+    metrics::counter!(USAGE_INVARIANT_VIOLATION_TOTAL, "kind" => kind).increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +170,7 @@ mod tests {
             EMBEDDINGS_TOTAL,
             EMBEDDINGS_DURATION_SECONDS,
             EMBEDDINGS_VECTORS_TOTAL,
+            USAGE_INVARIANT_VIOLATION_TOTAL,
         ] {
             assert!(
                 name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),

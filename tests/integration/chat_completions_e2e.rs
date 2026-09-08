@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use oxigate::domain::chat::{StreamChunk, Usage};
 use oxigate::domain::ports::ProviderError;
+use oxigate::domain::usage_accounting::CostStatus;
 
 use oxigate::api::CHAT_COMPLETIONS_PATH;
 use oxigate::config::OpenAICompatConfig;
@@ -122,6 +123,18 @@ async fn test_chat_completions_e2e_with_wiremock() {
     assert_ne!(
         cost_val, "0.000000",
         "model gpt-4.1 in pricing DB must produce non-zero request cost"
+    );
+    // The buffered twin of the streaming path's terminal-event `cost_status`: a buffered client
+    // reads the request-wide status from a response header, because there is no terminal event to
+    // carry it. gpt-4.1 has known bundled pricing and this usage is clean, so the value must be
+    // the exact status pricing produces — asserting "some string" would also pass a hard-coded
+    // `cost-unavailable`.
+    assert_eq!(
+        headers
+            .get(CostHeader::COST_STATUS)
+            .and_then(|v| v.to_str().ok()),
+        Some(CostStatus::Exact.as_str()),
+        "buffered chat response must carry the exact cost status its pricing produced"
     );
 
     let json: serde_json::Value = response.json();
@@ -342,10 +355,12 @@ async fn test_chat_completions_model_alias_resolution() {
     assert_eq!(json["model"].as_str(), Some("gpt-4-0613"));
 }
 
-/// Gherkin scenario 4: First chunk has model "gpt-4-0613", later chunk has "gpt-4-1";
-/// `CostHeader::MODEL_USED` in oxigate.usage JSON must be "gpt-4-0613" (first-wins). WARN on model change is
-/// implicit — the handler emits it when prev != m; tracing_test cannot capture it across the
-/// TestServer HTTP boundary.
+/// Gherkin scenario 4: First chunk has model "gpt-4o-2024-11-20" (bundled pricing), later chunk
+/// has "gpt-4o-mini-2024-07-18"; `CostHeader::MODEL_USED` in oxigate.usage JSON must be the
+/// first-wins model, and its cost status must be the exact value that model's bundled pricing
+/// and this clean usage produce — not merely "some string" a hard-coded `cost-unavailable`
+/// could also satisfy. WARN on model change is implicit — the handler emits it when prev != m;
+/// tracing_test cannot capture it across the TestServer HTTP boundary.
 #[tokio::test]
 async fn test_chat_completions_streaming_model_divergence() {
     let pg = PgContainer::start().await.expect("pg container must start");
@@ -353,31 +368,31 @@ async fn test_chat_completions_streaming_model_divergence() {
         .await
         .expect("redis container must start");
 
-    let chunk1_data = fixtures::openai_stream_chunk("gpt-4-0613", "Hello");
-    let chunk2_data = fixtures::openai_stream_chunk("gpt-4-1", " world");
+    let chunk1_data = fixtures::openai_stream_chunk("gpt-4o-2024-11-20", "Hello");
+    let chunk2_data = fixtures::openai_stream_chunk("gpt-4o-mini-2024-07-18", " world");
     let usage = Usage {
         prompt_tokens: 5,
         completion_tokens: 2,
         total_tokens: 7,
         ..Default::default()
     };
-    let chunk3_data = fixtures::openai_usage_chunk("gpt-4-1", 5, 2);
+    let chunk3_data = fixtures::openai_usage_chunk("gpt-4o-mini-2024-07-18", 5, 2);
 
     let chunks = vec![
         Ok(StreamChunk::new(
             Bytes::from(chunk1_data.clone()),
             None,
-            Some("gpt-4-0613".to_string()),
+            Some("gpt-4o-2024-11-20".to_string()),
         )),
         Ok(StreamChunk::new(
             Bytes::from(chunk2_data.clone()),
             None,
-            Some("gpt-4-1".to_string()),
+            Some("gpt-4o-mini-2024-07-18".to_string()),
         )),
         Ok(StreamChunk::new(
             Bytes::from(chunk3_data),
             Some(usage),
-            Some("gpt-4-1".to_string()),
+            Some("gpt-4o-mini-2024-07-18".to_string()),
         )),
     ];
 
@@ -416,11 +431,142 @@ async fn test_chat_completions_streaming_model_divergence() {
         serde_json::from_str(&usage_events[0].1).expect("oxigate.usage data must be JSON");
     assert_eq!(
         data.get(CostHeader::MODEL_USED).and_then(|v| v.as_str()),
-        Some("gpt-4-0613"),
-        "oxigate.usage model-used must be first chunk (gpt-4-0613), not later (gpt-4-1)"
+        Some("gpt-4o-2024-11-20"),
+        "oxigate.usage model-used must be first chunk (gpt-4o-2024-11-20), not later (gpt-4o-mini-2024-07-18)"
+    );
+    // The request-wide cost status cannot be an HTTP header on a streamed response — headers
+    // are sent before it is known — so the terminal event is where a streaming client reads it.
+    // The first-wins model has known bundled pricing and this usage is clean (no cache write,
+    // no reconciliation clamp), so the status must be the exact value that pricing produces —
+    // asserting "some string" would also pass a hard-coded `cost-unavailable`.
+    assert_eq!(
+        data.get("cost_status").and_then(|v| v.as_str()),
+        Some(CostStatus::Exact.as_str()),
+        "oxigate.usage cost_status must be the exact status the first-wins model's bundled \
+         pricing and this clean usage produce"
     );
     // WARN on model change: handler emits it when prev != m; tracing_test cannot capture
     // logs across the TestServer HTTP boundary, so we assert the observable first-wins result.
+}
+
+/// A clean provider EOF with no usage on any chunk is a request whose cost is *unavailable*, not
+/// a request that never happened.
+///
+/// It finalizes like every other cleanly-ended stream: one terminal `oxigate.usage` event
+/// carrying the status, and one spend row recording the identity, model and provider that would
+/// otherwise be lost. Every quantity on both is zero, because nothing was reported — the point is
+/// that the request leaves a trace at all.
+#[tokio::test]
+async fn test_chat_completions_stream_without_usage_finalizes_cost_unavailable() {
+    let pg = PgContainer::start().await.expect("pg container must start");
+    let redis = RedisContainer::start()
+        .await
+        .expect("redis container must start");
+
+    // The mid-stream-failure fixture's shape minus its trailing Err: content chunks that carry no
+    // usage, then a clean end of stream.
+    let chunks: Vec<Result<StreamChunk, ProviderError>> = vec![
+        Ok(StreamChunk::new(
+            Bytes::from(fixtures::openai_stream_chunk("gpt-4.1", "Hello")),
+            None,
+            Some("gpt-4.1".to_string()),
+        )),
+        Ok(StreamChunk::new(
+            Bytes::from(fixtures::openai_stream_chunk("gpt-4.1", "!")),
+            None,
+            Some("gpt-4.1".to_string()),
+        )),
+    ];
+
+    let provider = Arc::new(StreamStubAdapter::new(chunks));
+    let gateway = TestGateway::spawn(pg.pool.clone(), redis.pool.clone(), provider).await;
+
+    let body = serde_json::json!({
+        "model": "gpt-4.1",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    });
+
+    let response = gateway
+        .server
+        .post(CHAT_COMPLETIONS_PATH)
+        .add_header("Authorization", "Bearer sk-test-key")
+        .json(&body)
+        .await;
+
+    response.assert_status(StatusCode::OK);
+
+    let body_text = response.text();
+    let events = parse_sse_events(&body_text);
+
+    let usage_events: Vec<_> = events
+        .iter()
+        .filter(|(ev, _)| ev == "oxigate.usage")
+        .collect();
+    assert_eq!(
+        usage_events.len(),
+        1,
+        "a cleanly-ended stream must emit exactly one oxigate.usage event even with no usage"
+    );
+    let data: serde_json::Value =
+        serde_json::from_str(&usage_events[0].1).expect("oxigate.usage data must be JSON");
+    // The model is priced in the bundled DB, so `cost-unavailable` here is the verdict on the
+    // *usage*, not a side effect of an unpriced model.
+    assert_eq!(
+        data.get("cost_status").and_then(|v| v.as_str()),
+        Some(CostStatus::CostUnavailable.as_str()),
+        "a stream with no reported usage must report cost-unavailable"
+    );
+    assert_eq!(
+        data.get(CostHeader::REQUEST_COST).and_then(|v| v.as_str()),
+        Some("0.000000")
+    );
+    assert_eq!(
+        data.get(CostHeader::INPUT_TOKENS).and_then(|v| v.as_str()),
+        Some("0")
+    );
+    assert_eq!(
+        data.get(CostHeader::OUTPUT_TOKENS).and_then(|v| v.as_str()),
+        Some("0")
+    );
+    assert_eq!(
+        data.get(CostHeader::MODEL_USED).and_then(|v| v.as_str()),
+        Some("gpt-4.1")
+    );
+
+    // Allow the spawned spend write to complete before querying.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let rows: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT identity_id, model, provider, prompt_tokens, completion_tokens, cost_nano_usd \
+         FROM spend_records",
+    )
+    .fetch_all(&pg.pool)
+    .await
+    .expect("spend_records query");
+    assert_eq!(
+        rows.len(),
+        1,
+        "a cleanly-ended stream must write exactly one spend row even with no usage"
+    );
+    let (identity_id, model, provider_name, prompt_tokens, completion_tokens, cost_nano_usd) =
+        rows.into_iter().next().expect("one row");
+    assert_eq!(identity_id, "default");
+    assert_eq!(model, "gpt-4.1");
+    assert_eq!(provider_name, "stream-stub");
+    assert_eq!(prompt_tokens, 0);
+    assert_eq!(completion_tokens, 0);
+    assert_eq!(cost_nano_usd, 0, "no usage means no money moves");
+
+    let cost_status: String = sqlx::query_scalar("SELECT cost_status FROM spend_records LIMIT 1")
+        .fetch_one(&pg.pool)
+        .await
+        .expect("cost_status query");
+    assert_eq!(
+        cost_status,
+        CostStatus::CostUnavailable.as_str(),
+        "the persisted row must carry the same status the terminal event reported"
+    );
 }
 
 /// Gherkin scenario 5: Stub sends 2 valid chunks then error; gateway must emit

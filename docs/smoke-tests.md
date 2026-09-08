@@ -129,8 +129,10 @@ curl -sN -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Count to 3"}],"stream":true}' \
-  | grep 'data: \[DONE\]'
-# Expected: data: [DONE] line present — confirms stream completed
+  | grep -E 'data: \[DONE\]|event: oxigate\.usage'
+# Expected: `data: [DONE]` followed by `event: oxigate.usage` — the provider's terminator,
+#           then the gateway's own terminal event. The second line is the one that matters:
+#           it is only emitted once the request has been priced and its spend row scheduled.
 
 # 3. Function calling
 curl -s -X POST http://localhost:8080/v1/chat/completions \
@@ -234,8 +236,10 @@ curl -sN -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Count to 3"}],"stream":true}' \
-  | grep 'data: \[DONE\]'
-# Expected: data: [DONE] line present — confirms stream completed
+  | grep -E 'data: \[DONE\]|event: oxigate\.usage'
+# Expected: `data: [DONE]` followed by `event: oxigate.usage` — the provider's terminator,
+#           then the gateway's own terminal event. The second line is the one that matters:
+#           it is only emitted once the request has been priced and its spend row scheduled.
 
 # 3. Cost headers present
 curl -s -D - -o /dev/null -X POST http://localhost:8080/v1/chat/completions \
@@ -310,8 +314,10 @@ curl -sN -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Count to 3"}],"stream":true}' \
-  | grep 'data: \[DONE\]'
-# Expected: data: [DONE] line present — confirms stream completed
+  | grep -E 'data: \[DONE\]|event: oxigate\.usage'
+# Expected: `data: [DONE]` followed by `event: oxigate.usage` — the provider's terminator,
+#           then the gateway's own terminal event. The second line is the one that matters:
+#           it is only emitted once the request has been priced and its spend row scheduled.
 
 # 3. Tool use (function calling)
 curl -s -X POST http://localhost:8080/v1/chat/completions \
@@ -410,6 +416,110 @@ curl -s "http://localhost:8080/v1/spend/daily?from=2020-01-01&to=2021-12-31" \
   -H "Authorization: Bearer $OXIGATE_API_KEY" | jq .error
 # Expected: "invalid date range: range must not exceed 365 days"
 ```
+
+---
+
+## 10b. Streaming spend when the client stops at `[DONE]`
+
+**Why:** Every mainstream OpenAI SDK stops iterating a stream at `data: [DONE]` and closes the
+response there. It never reads to end of stream. A gateway that only finalizes accounting at
+EOF therefore loses the spend row for exactly the clients that matter most — silently, with a
+200 and a complete-looking response. This section proves the row is written at the provider's
+terminal chunk instead, so it does not depend on the client reading anything after it.
+
+The other streaming steps in this document cannot prove that: `curl` drains to EOF, so they
+pass either way. The proof needs an upstream that **holds the connection open past `[DONE]`**,
+making EOF unreachable inside the client's lifetime.
+
+**Prerequisites:** Postgres + Redis running, `python3`, and the official `openai` package
+(`pip install openai`). Ports 18080/18081 must be free. No provider key and no real spend
+required — the upstream is a local mock.
+
+```bash
+# ── 1. Mock upstream: OpenAI-shaped SSE that holds the socket open for 20s after [DONE] ──
+cat > /tmp/oxigate_done_mock.py <<'EOF'
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CHUNKS = [
+    'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}\n\n',
+    'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":" there"},"finish_reason":"stop"}]}\n\n',
+    'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n',
+    'data: [DONE]\n\n',
+]
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for c in CHUNKS:
+            b = c.encode()
+            self.wfile.write(f"{len(b):X}\r\n".encode() + b + b"\r\n")
+            self.wfile.flush()
+            time.sleep(0.05)
+        time.sleep(20)          # the load-bearing part: EOF is unreachable to the client
+        self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
+    def log_message(self, *a): pass
+
+ThreadingHTTPServer(("127.0.0.1", 18080), H).serve_forever()
+EOF
+python3 /tmp/oxigate_done_mock.py &
+MOCK_PID=$!
+
+# ── 2. Gateway config pointed at the mock ─────────────────────────────────
+cat > /tmp/oxigate_done_test.yaml <<'EOF'
+server:
+  port: 18081
+  host: "127.0.0.1"
+database:
+  url: "postgres://oxigate:changeme@localhost:5432/oxigate"
+redis:
+  url: "redis://localhost:6379"
+log_level: "info"
+providers:
+  openai:
+    api_key: "not-validated-by-the-mock"
+    api_base_url: "http://127.0.0.1:18080"
+EOF
+
+cargo run --release --bin oxigate -- --config /tmp/oxigate_done_test.yaml &
+GW_PID=$!
+until curl -sf http://127.0.0.1:18081/health/ready >/dev/null; do sleep 1; done
+
+# ── 3. Client: the real SDK, which stops at [DONE] ───────────────────────
+python3 - <<'EOF'
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:18081/v1", api_key="unused")
+n = 0
+with client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "hello"}],
+    stream=True,
+) as stream:
+    for _ in stream:
+        n += 1
+print(f"SDK stopped after {n} chunks without reading to end of stream")
+EOF
+
+# ── 4. The assertion — a spend row exists while the upstream is still open ──
+psql "postgres://oxigate:changeme@localhost:5432/oxigate" -t -c \
+  "SELECT count(*) FROM spend_records
+   WHERE model = 'gpt-4o-mini' AND prompt_tokens = 11 AND completion_tokens = 7
+     AND created_at > NOW() - INTERVAL '1 minute';"
+# Expected: 1
+# A 0 here is the regression: accounting waited for an EOF the client never reached.
+
+# ── 5. Teardown ───────────────────────────────────────────────────────────
+kill $GW_PID $MOCK_PID 2>/dev/null
+rm -f /tmp/oxigate_done_mock.py /tmp/oxigate_done_test.yaml
+```
+
+Run step 4 **before** the mock's 20-second hold expires. If it has expired, the run proves
+nothing either way — the stream reached EOF, which is the path this test exists to bypass.
 
 ---
 
@@ -574,9 +684,9 @@ done
 
 # Check provider distribution in spend_records (fails if no rows written)
 docker compose exec -T postgres psql -U oxigate oxigate \
-  -c "SELECT provider_name, COUNT(*) FROM spend_records 
+  -c "SELECT provider, COUNT(*) FROM spend_records 
       WHERE created_at > NOW() - INTERVAL '1 minute' 
-      GROUP BY provider_name;" | grep '([1-9]'
+      GROUP BY provider;" | grep '([1-9]'
 ```
 Expected: ~9 provider_a, ~1 provider_b (±15% noise)
 
@@ -593,7 +703,7 @@ done
 
 # Verify only provider_b was used (fails if no rows written)
 docker compose exec -T postgres psql -U oxigate oxigate \
-  -c "SELECT DISTINCT provider_name FROM spend_records 
+  -c "SELECT DISTINCT provider FROM spend_records 
       WHERE created_at > NOW() - INTERVAL '1 minute';" | grep '([1-9]'
 ```
 Expected: 4 provider_b (provider_a never selected)
@@ -609,7 +719,7 @@ curl -s -X POST http://localhost:8080/v1/chat/completions \
   -d '{"model":"claude-3-haiku-20240307","messages":[{"role":"user","content":"Hi"}]}' > /dev/null
 
 docker compose exec -T postgres psql -U oxigate oxigate \
-  -c "SELECT provider_name FROM spend_records 
+  -c "SELECT provider FROM spend_records 
       WHERE created_at > NOW() - INTERVAL '1 minute' 
       ORDER BY created_at DESC LIMIT 1;" | grep '([1-9]'
 ```

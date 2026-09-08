@@ -1165,3 +1165,125 @@ providers:
         "error should mention vertex_project, got: {err_msg}"
     );
 }
+
+// ── Terminal-chunk marking ────────────────────────────────────────────────────────────
+
+/// The synthesized terminator closes a Gemini stream, and only it does.
+///
+/// The content chunks ahead of it are mid-response even when one of them carries the final
+/// `finishReason` and the usage — Gemini reports both before the stream ends.
+#[tokio::test]
+async fn test_gemini_marks_only_the_synthesized_terminator() {
+    let mock = MockServer::start().await;
+    let ndjson = gemini_stream_chunk("Hello from Gemini", "STOP");
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .and(query_param("alt", "sse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(ndjson.as_bytes().to_vec(), "application/x-ndjson"),
+        )
+        .mount(&mock)
+        .await;
+
+    let config = gemini_config_api(mock.uri().trim_end_matches('/')).await;
+    let adapter = GeminiAdapter::new(config)
+        .await
+        .expect("adapter must build");
+
+    let req = ChatRequest {
+        model: "gemini-2.0-flash".into(),
+        messages: vec![Message {
+            role: Role::User,
+            content: Some(MessageContent::Text("Hi".into())),
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        temperature: None,
+        max_tokens: None,
+        max_completion_tokens: None,
+        stream: Some(true),
+        tools: None,
+        parallel_tool_calls: None,
+        request_id: Some("marking-req".into()),
+        extra: Default::default(),
+    };
+
+    let chunks: Vec<oxigate::domain::chat::StreamChunk> = adapter
+        .chat_completion_stream(&req)
+        .await
+        .expect("stream must start")
+        .map(|r| r.expect("chunk must be ok"))
+        .collect()
+        .await;
+
+    crate::common::assert_only_last_is_final(&chunks);
+    assert!(
+        String::from_utf8_lossy(&chunks[chunks.len() - 1].data).contains("[DONE]"),
+        "the marked chunk must be the terminator itself"
+    );
+}
+
+/// The terminator is synthesized after the loop and is emitted on every exit path, so it must not
+/// claim a completion the upstream never delivered. After a chunk carrying `finishReason` the
+/// adapter reads once more for the usage chunk; if that read fails the response ended mid-body,
+/// and the terminator is left unmarked.
+///
+/// The failing read is produced with invalid UTF-8, which is what `read_line` rejects — a
+/// deterministic stand-in for a transport abort, which this suite cannot stage.
+#[tokio::test]
+async fn test_gemini_leaves_the_terminator_unmarked_after_a_failed_trailing_read() {
+    let mock = MockServer::start().await;
+    let mut body = gemini_stream_chunk("Hello from Gemini", "STOP").into_bytes();
+    body.extend_from_slice(&[0xff, 0xfe, b'\n']);
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .and(query_param("alt", "sse"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"))
+        .mount(&mock)
+        .await;
+
+    let config = gemini_config_api(mock.uri().trim_end_matches('/')).await;
+    let adapter = GeminiAdapter::new(config)
+        .await
+        .expect("adapter must build");
+
+    let req = ChatRequest {
+        model: "gemini-2.0-flash".into(),
+        messages: vec![Message {
+            role: Role::User,
+            content: Some(MessageContent::Text("Hi".into())),
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        temperature: None,
+        max_tokens: None,
+        max_completion_tokens: None,
+        stream: Some(true),
+        tools: None,
+        parallel_tool_calls: None,
+        request_id: Some("truncated-req".into()),
+        extra: Default::default(),
+    };
+
+    let chunks: Vec<oxigate::domain::chat::StreamChunk> = adapter
+        .chat_completion_stream(&req)
+        .await
+        .expect("stream must start")
+        .map(|r| r.expect("chunk must be ok"))
+        .collect()
+        .await;
+
+    assert!(
+        String::from_utf8_lossy(&chunks[chunks.len() - 1].data).contains("[DONE]"),
+        "the terminator is still emitted"
+    );
+    assert!(
+        chunks.iter().all(|c| !c.is_final),
+        "an interrupted body must not be reported as a clean completion"
+    );
+}

@@ -2,8 +2,6 @@
 // Copyright (C) 2026 OxiGate contributors
 //! Budget middleware for per-identity soft-cap checks.
 //!
-//! Community tier — compiled for all builds.
-//!
 //! `BudgetLayer` runs pre-dispatch, reads current spend from Redis, emits deduplicated
 //! threshold warnings (80/90/100), and stores `BudgetCheckResult` in request extensions.
 //! `BudgetResponseLayer` runs post-dispatch and injects CostHeader::BUDGET_REMAINING header.

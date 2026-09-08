@@ -11,16 +11,16 @@ use std::collections::HashMap;
 /// by the auth Tower layer. All downstream middleware and handlers read from
 /// extensions — never re-derive identity.
 ///
-/// `id` is the stable budget/spend key. MVP uses the "default"
-/// sentinel.
-///
-/// Both fields use "default" sentinel in MVP; Pro/Enterprise tiers populate
-/// real values.
+/// `id` is the stable budget/spend key and `org_id` the tenancy scope. Under the
+/// single-key config auth this edition ships, there is no per-caller key registry to
+/// derive either from, so both hold the `"default"` sentinel. They are separate fields
+/// — and carried on every spend row and budget check — so that a richer identity source
+/// can populate them without changing any downstream reader.
 #[derive(Debug, Clone)]
 pub struct RequestIdentity {
-    /// Stable identity key. "default" for config-auth MVP.
+    /// Stable identity key. `"default"` under config auth.
     pub id: String,
-    /// Organisation scope. "default" for MVP; real org ID in Pro/Enterprise.
+    /// Organisation scope. `"default"` under config auth.
     /// Must scope all spend queries and budget checks.
     pub org_id: String,
     /// Human-readable label for logs/metrics (e.g. "dev-laptop-key").

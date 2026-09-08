@@ -147,11 +147,12 @@ present.
 | `supports_thinking` | bool | Whether the adapter includes extended-thinking models. |
 | `cost_per_input_token_usd` | float \| null | Input token cost in USD from pricing DB (base tier); null if not in pricing DB. |
 | `cost_per_output_token_usd` | float \| null | Output token cost in USD from pricing DB (base tier); null if not in pricing DB. |
-| `health_status` | string | `"available"` if startup health check passed; `"unknown"` otherwise. Dynamic tracking is. |
+| `health_status` | string | `"available"` if the startup health check passed; `"unknown"` otherwise. Reflects startup only — it is not re-evaluated per request, so it does not track a provider going down later. |
 
 **Known limitation:** capability flags (`supports_streaming`, `supports_tools`, etc.) are
-adapter-level, not per-model. All models from the same adapter share the adapter's flags.
-Per-model capability granularity is deferred to.
+adapter-level, not per-model. All models from the same adapter share the adapter's flags — so a
+model that does not support vision still reports `supports_vision: true` if any model from that
+adapter does. Per-model capability granularity is not implemented.
 
 ### Auth
 
@@ -191,6 +192,26 @@ On error (4xx/5xx from provider), zero-cost headers are injected (`0.000000` / `
 ### `spend_records` note
 
 Embedding spend rows always have `completion_tokens = 0`. Downstream queries on `spend_records` should not assume `completion_tokens > 0` for any row that may come from an embedding request.
+
+---
+
+## Request headers
+
+Beyond `Authorization` and `Content-Type`, OxiGate reads two optional attribution headers on
+every request. Both are ignored when absent.
+
+| Header | Example | Description |
+|---|---|---|
+| `X-OxiGate-Team` | `engineering` | Team attribution tag. Recorded on the request's `spend_records` row and available to team-scoped budgets. |
+| `X-OxiGate-Project` | `chat-assistant` | Project attribution tag. Recorded the same way. |
+
+Header names are case-insensitive, as HTTP requires. Values are sanitized before use:
+leading and trailing whitespace is trimmed, ASCII control characters are replaced with `_`,
+and the result is truncated to 128 bytes at a UTF-8 character boundary. A value that is empty
+after trimming is dropped rather than stored. Only the first value of a repeated header is read.
+
+Tags are attribution metadata only. They never change the authenticated identity or the org
+scope a request is billed to.
 
 ---
 
@@ -247,6 +268,139 @@ Result: `X-Oxigate-Budget-Remaining: 5.000000`
 
 The request is blocked when **any** budget reaches its hard cap.
 
+### X-Oxigate-Budget-Cap Header
+
+A request rejected by the instance-wide safety cap carries `X-Oxigate-Budget-Cap` on the 429,
+naming which cap rejected it:
+
+```
+HTTP/1.1 429 Too Many Requests
+X-Oxigate-Budget-Cap: global
+
+{"error":"global_budget_cap_exceeded"}
+```
+
+`global` is currently the only value. The check runs ahead of authentication and applies to
+every `/v1/*` route, so it fires before any provider is contacted and before any per-identity
+or per-team budget is consulted. It is configured by
+`budget.global_safety_cap_usd`; when that is unset, the check is skipped entirely and the
+header is never emitted.
+
+A 429 from a per-identity, team, or tag budget carries `X-Oxigate-Budget-Remaining: 0.000000`
+instead — the two headers distinguish which layer rejected the request.
+
+### SSE terminal usage event
+
+A stream that ends cleanly is closed by an `event: oxigate.usage` SSE event carrying the
+request's cost and token totals:
+
+```
+event: oxigate.usage
+data: {"X-Oxigate-Request-Cost":"0.004212","X-Oxigate-Input-Tokens":"312","X-Oxigate-Output-Tokens":"87","X-Oxigate-Model-Used":"gpt-4.1","cost_status":"exact"}
+
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `X-Oxigate-Request-Cost` | string | Total cost as a decimal USD string |
+| `X-Oxigate-Input-Tokens` | string | Input tokens as reported by the provider |
+| `X-Oxigate-Output-Tokens` | string | Output tokens as reported by the provider |
+| `X-Oxigate-Model-Used` | string | Model named by the provider's own stream chunks, which may differ from the requested one. **Falls back to the requested model when no chunk names one** — including when a fallback target served a different model via `model_override`, so on that path it can report the model that was asked for rather than the one that ran. Known limitation; do not treat it as an authoritative record of what executed |
+| `cost_status` | string | `exact`, `reconciled`, `rate-fallback` or `cost-unavailable` — how much confidence the cost carries |
+
+The members reuse the names of the cost headers a buffered response carries, because they report
+the same quantities. `cost_status` is the exception and has no header twin on a streamed
+response: the request-wide status is not known when the HTTP headers are sent, so the terminal
+event is the only place a streaming client can read it.
+
+> **Once the provider's stream reaches its terminating chunk, accounting no longer depends on the
+> client reading that chunk or anything after it — but the terminal event is still only
+> *observable* to a client that reads past `data: [DONE]`.**
+>
+> The event is appended *after* the upstream's own `data: [DONE]` line, which the gateway forwards
+> verbatim, and the official OpenAI SDKs treat `[DONE]` as the end of the stream and stop iterating
+> there. That wire ordering is unchanged, and it is not a scheduling problem: the event cannot
+> precede the terminator it reports on. So a client that stops at `[DONE]` does not see
+> `oxigate.usage`, and `cost_status` remains readable only by an SSE or HTTP client of your own
+> that reads to end of stream.
+>
+> **What no longer depends on the client is the accounting.** When the provider reaches a clean,
+> completed end of response, the gateway computes the cost, increments the cost metric, emits the
+> `chat_completion_cost` log line and schedules the `spend_records` write *before* forwarding the
+> terminating chunk. A client that stops at `[DONE]`, or right after the `oxigate.usage` event,
+> still leaves exactly one row, one metric increment and one log line for that request — it is
+> visible to `/v1/spend/*` and counts against budgets like any other request.
+>
+> **Before the terminating chunk there is no guarantee in either direction.** Whether a client
+> that disconnects mid-response leaves a row depends on how much of the stream the gateway had
+> already processed, which is not something the client controls: the gateway forwards as fast as
+> the socket accepts writes, so a short response is often written out — terminating chunk and all —
+> before the disconnect is observed at all, and that request is accounted normally. A disconnect
+> that does land mid-response stops the gateway polling the provider, and the partial usage
+> observed up to that point is discarded rather than billed, as for the mid-stream failures
+> described below. Do not build reconciliation on "an abandoned stream leaves no row"; it is true
+> only when the abandonment actually interrupted the stream.
+>
+> **Adapter contract — where the guarantee holds.** It holds for the provider adapters bundled
+> with the gateway, and for any third-party adapter that marks its clean terminal chunk as such.
+> An adapter that does not mark one is not covered: its requests are still accounted, but only
+> once the consumer polls the response body past the last chunk, so a client that stops early
+> leaves no row. If you maintain an adapter outside this crate, mark the chunk that completes a
+> normally-completed upstream response — and only that chunk; the crate rustdoc states the
+> contract in full.
+>
+> **One precondition applies to the OpenAI-compatible lanes** — `openai`, `azure`, and every
+> `openai_compat` backend. Those adapters recognize the end of a response by the terminator the
+> protocol defines: a `data: [DONE]` event, meaning that line *and* the blank line that closes it.
+> A backend that ends its stream by closing the connection without sending `[DONE]`, or that sends
+> the marker without the trailing blank line, has not signalled a completion the adapter can
+> certify, so its requests fall back to end-of-stream accounting. Mainstream OpenAI-compatible
+> servers terminate properly; a homegrown one may not, and a missing row for a client that stops
+> early is the symptom.
+>
+> **Two kinds of non-clean ending, with different accounting — do not read them as one.**
+>
+> - An **error-interrupted** stream — inter-chunk timeout, upstream disconnect — is charged
+>   nothing at all. Finalization is skipped outright: no terminal event, no row, no metric, no log,
+>   whether or not the client keeps reading. That is the mid-stream-failure behaviour described
+>   below, and it is unchanged.
+> - A **degraded but non-error termination** — the stream ends without the adapter certifying a
+>   clean completion, as when the gateway itself emits a terminal event because it gave up on a
+>   response it could not continue handling — is *not* an error, and is still accounted. But it is
+>   accounted the old way: through end-of-stream finalization, which happens only once the consumer
+>   polls the body past the last chunk. A client that stops at such an event therefore leaves no
+>   row, exactly as every streamed request did before this change. This residual is known; it is
+>   narrower than the defect it is left over from, but it is not zero.
+>
+> Note what the guarantee does *not* say: it means the request is always *recorded*, not that its
+> cost is always *right*. A streamed or buffered request can still finalize `rate-fallback` or
+> `cost-unavailable` — a backend that reports no `usage` is one such case — and those rows carry
+> zero or approximate cost like any other. On a buffered response read `X-Oxigate-Cost-Status`; on
+> a streamed one read `cost_status` off the terminal event, which requires reading past `[DONE]`.
+> A budget bound only by rows of unknown cost will still bind late.
+
+**A stream whose provider reported no usage is finalized as `cost-unavailable`** — the event
+carries zero cost and zero tokens, and a matching zero `spend_records` row is written. Those zeros
+mean the quantities were never reported, not that the request was free. Two things cause it: a
+backend that sends no `usage` on its stream unless asked — and is not asked, because
+`stream_options_support` is `false` for that instance, which is the default — and an unparseable
+terminal event, which any provider lane can produce. Treat `cost-unavailable` as "this request's
+cost is unknown", and do not aggregate its zeros into a spend or size total.
+
+Note that `stream_options_support: false` does not by itself mean usage is missing: it disables
+*injecting* `stream_options.include_usage`, while the gateway still parses `usage` out of every
+forwarded chunk. A backend that volunteers it is costed normally on that setting.
+
+Both statements describe the row and the event alike. Per the note above, the row is written for
+a cleanly-completed stream however far the client reads; the event is only *seen* by a client that
+reads past `[DONE]`.
+
+Clients that treat the *absence* of a terminal event as meaningful should note two things. It
+appears where it previously did not — a stream whose provider reported no usage now emits one. And
+it is not a billing signal: not receiving it, because you stopped reading at `[DONE]`, does not
+mean the request went unrecorded. An **error-interrupted** stream still emits no `oxigate.usage`
+event — see below.
+
 ### SSE streaming error events
 
 When a streaming response is interrupted (inter-chunk timeout, upstream disconnect), the
@@ -279,9 +433,22 @@ planned for a future release.
 | Concern | Impact | Why |
 |---|---|---|
 | Wasted spend | Tiny | Mid-stream failures are rare (<5 % of all failures). Most 429s arrive before the first chunk. |
-| Budget tracking | None | Every token delivered before failure is still tracked and charged. No spend disappears. |
+| Budget tracking | **Undercount** | An interrupted stream is charged **nothing**. Finalization is skipped entirely: no `oxigate.usage` event, no spend row, no budget increment — even when partial usage was observed before the failure. That spend is not recorded anywhere. |
 | Double-charging | None | A failed stream is not retried automatically — no double spend. A manual user retry is a new request. |
-| Cost accuracy | None | Partial delivery = partial charge. The gateway charges for what was delivered, which is correct. |
+| Cost accuracy | **Undercharge** | Partial delivery is charged as zero, not as a partial charge. The partial usage is deliberately discarded rather than billed, on the grounds that a half-observed count reported as a charge is worse than no charge; the cost of that choice is that the provider may still bill for the tokens it delivered. |
+
+Reconcile against provider invoices rather than against `spend_records` alone where mid-stream
+failures are frequent: the gap is real spend that the gateway did not record. This is deliberate
+behaviour, not a defect — but the direction of the error is understatement, so a budget will bind
+later than the true spend warrants.
+
+A stream that ends **cleanly** is unaffected by mid-stream-failure accounting: it is finalized
+however far the client reads the body, and one that reported no usage is recorded as
+`cost-unavailable` rather than dropped. A client that stops at `data: [DONE]`, as the official
+OpenAI SDKs do, was once a second and larger source of the same understatement; it no longer is,
+for the bundled adapters and any adapter honouring the terminal-chunk contract — see the note under
+[SSE terminal usage event](#sse-terminal-usage-event). Mid-stream failures remain, so reconcile
+against provider invoices where they are frequent.
 
 #### User experience impact
 

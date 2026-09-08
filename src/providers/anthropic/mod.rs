@@ -17,17 +17,23 @@ use futures::StreamExt;
 use secrecy::ExposeSecret;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use std::sync::{Arc, RwLock};
+
 use crate::config::AnthropicConfig;
 use crate::domain::chat::{ChatRequest, ChatResponse};
 use crate::domain::ports::{
     ChatCompletionStream, HealthStatus, ProviderAdapter, ProviderAdapterExt, ProviderError,
     ProviderKind, ProviderMetadata,
 };
+use serde::de::DeserializeSeed;
+
+use crate::domain::pricing::{PricingDb, snapshot_pricing_context};
+use crate::domain::usage_accounting::{CacheWriteAccumulator, PricingContext};
 use crate::providers::anthropic::translate::{
     DEFAULT_MAX_TOKENS, StreamErr, StreamTranslator, anthropic_to_chat_response,
-    chat_request_to_anthropic, overflow_sse_event, parse_stream_event,
+    chat_request_to_anthropic, overflow_sse_event,
 };
-use crate::providers::anthropic::types::{MessagesRequest, MessagesResponse};
+use crate::providers::anthropic::types::{MessagesRequest, MessagesResponse, MessagesResponseSeed};
 use crate::providers::tool_limits::DEFAULT_TOOL_CALL_BUFFER_CAP_BYTES;
 use crate::utils::provider_error::classify_reqwest_error;
 
@@ -36,6 +42,14 @@ const ANTHROPIC_VERSION_DEFAULT: &str = "2023-06-01";
 const ANTHROPIC_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
 /// Known Anthropic models with capability flags. (model_id, supports_thinking)
+///
+/// Entries removed here because Anthropic has retired them
+/// (platform.claude.com/docs/en/about-claude/model-deprecations) — requests to a retired
+/// model fail outright, so advertising it via /v1/models publishes false capability metadata:
+/// claude-sonnet-4-20250514, claude-opus-4-20250514 (retired 2026-06-15), claude-opus-4-1-20250805
+/// (retired 2026-08-05), claude-3-7-sonnet-20250219, claude-3-5-haiku-20241022 (retired
+/// 2026-02-19), claude-3-5-sonnet-20241022 (retired 2025-10-28), claude-3-opus-20240229 (retired
+/// 2026-01-05), claude-3-haiku-20240307 (retired 2026-04-20).
 const KNOWN_ANTHROPIC_MODELS: &[(&str, bool)] = &[
     // ── Current generation ──────────────────────────────────────────────────
     ("claude-opus-4-6", true),
@@ -44,15 +58,6 @@ const KNOWN_ANTHROPIC_MODELS: &[(&str, bool)] = &[
     // ── Legacy (still available — migrate when convenient) ───────────────────
     ("claude-sonnet-4-5-20250929", true),
     ("claude-opus-4-5-20251101", true),
-    ("claude-opus-4-1-20250805", true),
-    ("claude-sonnet-4-20250514", true),
-    ("claude-opus-4-20250514", true),
-    ("claude-3-7-sonnet-20250219", true), // deprecated per Anthropic docs
-    ("claude-3-5-sonnet-20241022", false),
-    ("claude-3-5-haiku-20241022", false),
-    ("claude-3-opus-20240229", false), // deprecated
-    // RETIRING 2026-04-19 — migrate to claude-haiku-4-5-20251001
-    ("claude-3-haiku-20240307", false),
 ];
 
 fn anthropic_base_url(config: &AnthropicConfig) -> String {
@@ -81,11 +86,21 @@ pub struct AnthropicAdapter {
     api_key: String,
     /// Effective tool-call streaming buffer cap — resolved once at construction.
     cap_bytes: usize,
+    /// Hot-reload pricing holder. Each request clones one generation out of it before dispatch,
+    /// so the cache-write class registry a response is accounted against and the rates it is
+    /// priced with come from the same pricing database.
+    pricing_db: Arc<RwLock<PricingDb>>,
 }
 
 impl AnthropicAdapter {
     /// Creates an Anthropic adapter. Config must be validated by GatewayConfig::validate.
-    pub async fn new(config: AnthropicConfig) -> Result<Self, ProviderError> {
+    ///
+    /// `pricing_db` is the same hot-reload holder the cost calculator reads; the adapter needs it
+    /// to snapshot one pricing generation per request before dispatch.
+    pub async fn new(
+        config: AnthropicConfig,
+        pricing_db: Arc<RwLock<PricingDb>>,
+    ) -> Result<Self, ProviderError> {
         let api_key = config
             .api_key
             .as_ref()
@@ -132,7 +147,18 @@ impl AnthropicAdapter {
             metadata,
             api_key,
             cap_bytes,
+            pricing_db,
         })
+    }
+
+    /// Snapshots this request's pricing generation.
+    ///
+    /// Called once per request, before the upstream request is dispatched, on the buffered path
+    /// as well as the streaming one: a buffered request dispatched under one database but
+    /// completing after a reload must not price against the next one while an equivalent stream
+    /// prices against the first.
+    fn pricing_context(&self) -> PricingContext {
+        snapshot_pricing_context(&self.pricing_db)
     }
 
     fn model(&self, req_model: &str) -> String {
@@ -226,6 +252,10 @@ impl ProviderAdapter for AnthropicAdapter {
             default_max_tokens(&self.config),
         )?;
 
+        // Acquired before dispatch, matching the streaming path: a buffered request completing
+        // after a reload must not price against a generation it was never dispatched under.
+        let pricing_context = self.pricing_context();
+
         let request = self.build_base_request(&anthropic_req, false);
         let start = std::time::Instant::now();
         let resp = request
@@ -238,12 +268,35 @@ impl ProviderAdapter for AnthropicAdapter {
             return Err(self.map_error_response(status, resp).await);
         }
 
-        let anthropic_resp: MessagesResponse = resp
-            .json()
+        // Driven by a seed rather than `resp.json()`: the cache-write detail object has to be
+        // credited into this request's accumulator as it is read, and a derived `Deserialize`
+        // never invokes a seed.
+        let body = resp
+            .bytes()
             .await
             .map_err(|e| ProviderError::Serialization(e.to_string()))?;
+        // The seed proposes the cache-write snapshot rather than crediting it: a body with
+        // trailing data after it is not a response, and nothing it stated may reach billing.
+        let (anthropic_resp, cache_write): (MessagesResponse, _) = {
+            let mut de = serde_json::Deserializer::from_slice(&body);
+            let parsed = MessagesResponseSeed::new(pricing_context.registry())
+                .deserialize(&mut de)
+                .map_err(|e| ProviderError::Serialization(e.to_string()))?;
+            de.end()
+                .map_err(|e| ProviderError::Serialization(e.to_string()))?;
+            (parsed.response, parsed.cache_write)
+        };
+        let accumulator = cache_write
+            .unwrap_or_else(|| CacheWriteAccumulator::new(pricing_context.registry().clone()));
 
-        anthropic_to_chat_response(&anthropic_resp, &model, request_id, self.cap_bytes)
+        anthropic_to_chat_response(
+            &anthropic_resp,
+            &model,
+            request_id,
+            self.cap_bytes,
+            &pricing_context,
+            accumulator,
+        )
     }
 
     async fn chat_completion_stream(
@@ -259,6 +312,10 @@ impl ProviderAdapter for AnthropicAdapter {
             default_max_tokens(&self.config),
         )?;
         anthropic_req.stream = Some(true);
+
+        // Acquired before dispatch: the generation this response is accounted against must be the
+        // one the request started under, not whichever database a mid-flight reload installed.
+        let pricing_context = self.pricing_context();
 
         let request = self.build_base_request(&anthropic_req, true);
         let start = std::time::Instant::now();
@@ -280,11 +337,11 @@ impl ProviderAdapter for AnthropicAdapter {
         let mut lines = reader.lines();
 
         let cap_bytes = self.cap_bytes;
-        let mut translator = StreamTranslator::new(model, request_id, cap_bytes);
+        let mut translator = StreamTranslator::new(model, request_id, cap_bytes, pricing_context);
 
         let output = async_stream::stream! {
             while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(event) = parse_stream_event(&line) {
+                if let Some(event) = translator.parse_event(&line) {
                     match translator.process_event(&event) {
                         Ok(Some(chunk)) => yield Ok(chunk),
                         Ok(None) => {}
@@ -322,6 +379,37 @@ impl ProviderAdapter for AnthropicAdapter {
                 }
             }
             Err(_) => HealthStatus::Unhealthy,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KNOWN_ANTHROPIC_MODELS;
+
+    /// The default advertised catalogue (`GET /v1/models` and provider dispatch both read
+    /// `KNOWN_ANTHROPIC_MODELS`) must never list a model Anthropic has retired — a retired
+    /// model's requests fail outright, so listing it publishes false capability metadata.
+    /// This asserts against every model this file has confirmed retired via
+    /// platform.claude.com/docs/en/about-claude/model-deprecations, so a future re-add of any
+    /// of them fails this test instead of shipping silently.
+    #[test]
+    fn known_anthropic_models_excludes_retired_models() {
+        const RETIRED: &[&str] = &[
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-opus-4-1-20250805",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-5-haiku-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-haiku-20240307",
+        ];
+        for (id, _) in KNOWN_ANTHROPIC_MODELS {
+            assert!(
+                !RETIRED.contains(id),
+                "KNOWN_ANTHROPIC_MODELS advertises retired model {id}"
+            );
         }
     }
 }

@@ -128,9 +128,12 @@ async fn test_embeddings_metrics_incremented_on_success() {
     wiremock_stubs::stub_openai_embeddings(&mock, "text-embedding-3-small", 42).await;
 
     let provider = Arc::new(
-        OpenAiAdapter::new(openai_config(&mock.uri()))
-            .await
-            .expect("OpenAiAdapter must build"),
+        OpenAiAdapter::new(
+            openai_config(&mock.uri()),
+            crate::common::bundled_pricing_holder(),
+        )
+        .await
+        .expect("OpenAiAdapter must build"),
     );
     let state = app_state_with_provider(provider);
     let app = router_with_metrics(state, handle.clone());
@@ -193,9 +196,12 @@ async fn test_embeddings_metrics_cost_not_incremented_on_error() {
     wiremock_stubs::stub_openai_embeddings_error(&mock, 500).await;
 
     let provider = Arc::new(
-        OpenAiAdapter::new(openai_config(&mock.uri()))
-            .await
-            .expect("OpenAiAdapter must build"),
+        OpenAiAdapter::new(
+            openai_config(&mock.uri()),
+            crate::common::bundled_pricing_holder(),
+        )
+        .await
+        .expect("OpenAiAdapter must build"),
     );
     let state = app_state_with_provider(provider);
     let app = router_with_metrics(state, handle.clone());
@@ -263,9 +269,12 @@ async fn test_embeddings_metrics_suppressed_on_no_usage() {
     wiremock_stubs::stub_openai_embeddings_no_usage(&mock, "text-embedding-3-small").await;
 
     let provider = Arc::new(
-        OpenAiAdapter::new(openai_config(&mock.uri()))
-            .await
-            .expect("OpenAiAdapter must build"),
+        OpenAiAdapter::new(
+            openai_config(&mock.uri()),
+            crate::common::bundled_pricing_holder(),
+        )
+        .await
+        .expect("OpenAiAdapter must build"),
     );
     let state = app_state_with_provider(provider);
     let app = router_with_metrics(state, handle.clone());
@@ -332,9 +341,12 @@ async fn test_embedding_and_chat_cost_labels_distinct() {
     wiremock_stubs::stub_openai_embeddings(&mock, "text-embedding-3-small", 20).await;
 
     let provider = Arc::new(
-        OpenAiAdapter::new(openai_config(&mock.uri()))
-            .await
-            .expect("OpenAiAdapter must build"),
+        OpenAiAdapter::new(
+            openai_config(&mock.uri()),
+            crate::common::bundled_pricing_holder(),
+        )
+        .await
+        .expect("OpenAiAdapter must build"),
     );
     let state = app_state_with_provider(provider);
     let app = router_with_metrics(state, handle.clone());

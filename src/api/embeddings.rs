@@ -205,20 +205,24 @@ pub async fn embeddings(
             let mut resp = if let Some(ref usage) = response.usage {
                 // /v1/embeddings is the sync endpoint — batch discount applies only to
                 // /v1/batches (async Batch API). Always false here regardless of input shape.
-                let (cost_headers, cost_breakdown, token_usage) = build_embedding_cost_headers(
+                let (cost_headers, accounting) = build_embedding_cost_headers(
                     &model_used,
                     usage,
                     Arc::clone(&state.pricing_db),
                     false,
                 );
-                let cost_usd = cost_breakdown.total_cost.to_display_string();
+                crate::utils::cost_headers::report_finalized_warning(
+                    &request_id,
+                    &model_used,
+                    &accounting,
+                );
+                let cost_usd = accounting.cost.total_cost.to_display_string();
 
                 let record = SpendRecord::build(
                     &identity,
                     &model_used,
                     &provider_name,
-                    &token_usage,
-                    &cost_breakdown,
+                    &accounting,
                     latency_ms,
                 );
                 let budget = state.budget_settings.read().await.clone();
@@ -240,7 +244,7 @@ pub async fn embeddings(
                     "provider" => provider_name.clone(),
                     "endpoint" => ENDPOINT_EMBEDDINGS
                 )
-                .increment(cost_breakdown.total_cost.as_u64());
+                .increment(accounting.cost.total_cost.as_u64());
 
                 let mut r = (StatusCode::OK, Json(response)).into_response();
                 r.headers_mut().extend(cost_headers);

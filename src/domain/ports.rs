@@ -18,8 +18,9 @@ use bytes::Bytes;
 use futures::Stream;
 use thiserror::Error;
 
-use crate::domain::chat::{ChatRequest, ChatResponse, StreamChunk};
+use crate::domain::chat::{ChatRequest, ChatResponse, ReasoningAccounting, StreamChunk};
 use crate::domain::embedding::{EmbeddingRequest, EmbeddingResponse};
+use crate::domain::usage_accounting::{CacheWriteAccounting, CostStatus};
 
 /// Nano-dollars: 1 USD = 1_000_000_000 nano-USD.
 ///
@@ -134,6 +135,13 @@ impl Sub for NanoUsd {
 ///
 /// Supports input/output and cache fields, with provider-specific extensions
 /// (thinking, modalities, etc.).
+///
+/// `#[non_exhaustive]`: an approved breaking change made while no customer compatibility
+/// constraint exists. A crate outside this one cannot name this struct in a literal at all —
+/// struct-update syntax included — so it builds a value from
+/// [`Default::default()`](Default::default) and assigns the public fields it needs. Adding a
+/// field is then not a breaking change for such a caller.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
     /// Total input (prompt) tokens.
@@ -142,11 +150,16 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     /// Cache-read input tokens (billed at input × cache_read_multiplier).
     pub cache_read_input_tokens: u64,
-    /// Ephemeral 5-minute cache write tokens.
-    pub cache_write_5m_tokens: u64,
-    /// Ephemeral 1-hour cache write tokens.
-    pub cache_write_1h_tokens: u64,
+    /// Generalized cache-write accounting: reconciled quantity, per-class totals and the
+    /// pricing generation this request accumulated against.
+    ///
+    /// Replaces the fixed 5-minute / 1-hour token pair: the classes a provider reports are
+    /// data, not struct fields, so a new class becomes billable through pricing data alone.
+    pub cache_write: CacheWriteAccounting,
     /// Thinking/reasoning tokens (model-specific rate).
+    ///
+    /// Whether these are also counted inside `output_tokens` depends on the provider contract —
+    /// see `reasoning_accounting`.
     pub thinking_tokens: u64,
     /// Image units billed for this request .
     pub image_count: u64,
@@ -154,8 +167,37 @@ pub struct TokenUsage {
     pub audio_seconds: f64,
     /// Batch API request (50% discount when true).
     pub batch: bool,
-    /// Tier threshold override for Gemini (input+cached for tier selection).
-    pub tier_threshold_override: Option<u64>,
+    /// Whether `thinking_tokens` are already contained in `output_tokens`.
+    ///
+    /// Defaults to `Additive`, under which `output_tokens` is charged whole — the behaviour of
+    /// every caller that constructs this type with `..Default::default()`.
+    pub reasoning_accounting: ReasoningAccounting,
+}
+
+impl TokenUsage {
+    /// Total prompt occupying the context window — the tier-selection dimension.
+    /// Derived from the billing buckets; never provider-supplied.
+    pub fn context_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.cache_write.accounted_tokens())
+    }
+
+    /// Output tokens to charge at the standard output rate, with reasoning carved out where the
+    /// provider contract already counts it inside `output_tokens`.
+    ///
+    /// `thinking_tokens` are charged separately by the calculator. Under `IncludedInOutput`,
+    /// charging the full `output_tokens` beside them would bill the reasoning subset twice.
+    /// Saturates at zero, so a provider reporting more reasoning than completion tokens yields
+    /// no standard output charge rather than wrapping.
+    pub fn standard_output_tokens(&self) -> u64 {
+        match self.reasoning_accounting {
+            ReasoningAccounting::IncludedInOutput => {
+                self.output_tokens.saturating_sub(self.thinking_tokens)
+            }
+            ReasoningAccounting::Additive => self.output_tokens,
+        }
+    }
 }
 
 /// Cost breakdown for a single request.
@@ -163,8 +205,11 @@ pub struct TokenUsage {
 /// Input/output/cache/modality/batch cost breakdown per request.
 /// All fields use integer nano-USD.
 ///
-/// `#[non_exhaustive]` allows new cost dimensions without breaking plugin authors
-/// implementing `CostCalculator` — they use `..Default::default()` for future fields.
+/// `#[non_exhaustive]` allows new cost dimensions without breaking plugin authors implementing
+/// `CostCalculator`. Such a plugin lives outside this crate, so it cannot write a literal for
+/// this struct — struct-update syntax included — and instead starts from
+/// [`Default::default()`](Default::default) and assigns the public fields it computes. A new
+/// cost dimension then arrives already defaulted rather than failing that plugin's build.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct CostBreakdown {
@@ -174,10 +219,9 @@ pub struct CostBreakdown {
     pub output_cost: NanoUsd,
     /// Cost from cache-read tokens.
     pub cached_input_cost: NanoUsd,
-    /// Cost from 5m cache write tokens.
-    pub cache_write_5m_cost: NanoUsd,
-    /// Cost from 1h cache write tokens.
-    pub cache_write_1h_cost: NanoUsd,
+    /// Cost from every cache-write class combined — configured classes at their exact
+    /// multiplier, unknown classes and any unmatched aggregate residual at the fallback rate.
+    pub cache_write_cost: NanoUsd,
     /// Cost from thinking tokens.
     pub thinking_cost: NanoUsd,
     /// Cost from image units .
@@ -186,6 +230,14 @@ pub struct CostBreakdown {
     pub audio_cost: NanoUsd,
     /// Total cost (sum of components).
     pub total_cost: NanoUsd,
+    /// How much confidence this breakdown carries — see [`CostStatus`].
+    ///
+    /// Defaults to [`CostStatus::CostUnavailable`], the worst value. An external
+    /// `CostCalculator` builds its breakdown from [`Default::default()`](Default::default) and
+    /// assigns what it computes, so one that never considers status leaves this at
+    /// `cost-unavailable` — confidence has to be asserted deliberately, never acquired by
+    /// omission.
+    pub status: CostStatus,
 }
 
 impl CostBreakdown {
@@ -716,6 +768,60 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::NanoUsd;
+    use super::{ReasoningAccounting, TokenUsage};
+
+    // --- TokenUsage::standard_output_tokens ---
+
+    /// `Additive`: reasoning sits outside the completion total, so the whole of it is charged at
+    /// the standard output rate.
+    #[test]
+    fn standard_output_tokens_additive_returns_output_unchanged() {
+        let usage = TokenUsage {
+            output_tokens: 1_000,
+            thinking_tokens: 800,
+            reasoning_accounting: ReasoningAccounting::Additive,
+            ..Default::default()
+        };
+        assert_eq!(usage.standard_output_tokens(), 1_000);
+    }
+
+    /// `IncludedInOutput`: reasoning is already inside the completion total, so it is carved out
+    /// before the remainder is charged at the standard output rate.
+    #[test]
+    fn standard_output_tokens_included_in_output_subtracts_reasoning() {
+        let usage = TokenUsage {
+            output_tokens: 1_000,
+            thinking_tokens: 800,
+            reasoning_accounting: ReasoningAccounting::IncludedInOutput,
+            ..Default::default()
+        };
+        assert_eq!(usage.standard_output_tokens(), 200);
+    }
+
+    /// A provider reporting more reasoning than completion tokens clamps to zero rather than
+    /// wrapping to a near-`u64::MAX` charge.
+    #[test]
+    fn standard_output_tokens_saturates_at_zero() {
+        let usage = TokenUsage {
+            output_tokens: 500,
+            thinking_tokens: 900,
+            reasoning_accounting: ReasoningAccounting::IncludedInOutput,
+            ..Default::default()
+        };
+        assert_eq!(usage.standard_output_tokens(), 0);
+    }
+
+    /// The default is `Additive`, so every `..Default::default()` construction keeps charging the
+    /// reported completion total whole.
+    #[test]
+    fn standard_output_tokens_defaults_to_charging_the_reported_total() {
+        let usage = TokenUsage {
+            output_tokens: 1_000,
+            thinking_tokens: 800,
+            ..Default::default()
+        };
+        assert_eq!(usage.standard_output_tokens(), usage.output_tokens);
+    }
 
     // --- NanoUsd::sub (saturating) ---
 

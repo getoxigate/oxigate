@@ -2,6 +2,9 @@
 // Copyright (C) 2026 OxiGate contributors
 //! Stub ProviderAdapter for tests that don't need chat functionality.
 
+use std::time::Duration;
+
+use async_stream::stream;
 use async_trait::async_trait;
 
 use oxigate::domain::chat::{ChatRequest, ChatResponse, StreamChunk};
@@ -135,9 +138,16 @@ impl ProviderAdapterExt for ModelsTestAdapter {}
 
 /// Stub adapter that yields a configurable stream of chunks.
 /// Used for streaming E2E tests (model divergence, mid-stream failure).
+///
+/// The two delay builders exist so a test can decide *where* the stream is parked when the
+/// client goes away. Without them every chunk is ready on the first poll, the whole body is
+/// written into the socket before the client can react, and a test that means to disconnect
+/// part-way silently exercises the read-to-completion path instead.
 pub struct StreamStubAdapter {
     metadata: ProviderMetadata,
     chunks: Vec<Result<StreamChunk, ProviderError>>,
+    inter_chunk_delay: Duration,
+    trailing_hold: Duration,
 }
 
 impl StreamStubAdapter {
@@ -157,7 +167,37 @@ impl StreamStubAdapter {
                 ..Default::default()
             },
             chunks,
+            inter_chunk_delay: Duration::ZERO,
+            trailing_hold: Duration::ZERO,
         }
+    }
+
+    /// Overrides the provider name reported by `metadata()`.
+    ///
+    /// Metric assertions need it: cost counters are keyed by provider, with no request
+    /// dimension, so tests that read a counter delta must not share a label with another test
+    /// running in the same process.
+    #[must_use]
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.metadata.name = name.to_string();
+        self
+    }
+
+    /// Waits this long before yielding each chunk after the first.
+    #[must_use]
+    pub fn with_inter_chunk_delay(mut self, delay: Duration) -> Self {
+        self.inter_chunk_delay = delay;
+        self
+    }
+
+    /// Waits this long after the last chunk before the stream ends.
+    ///
+    /// Keeps the stream open past its final chunk, so a consumer that finalizes only on
+    /// end-of-stream stays parked and cannot reach finalization within a test's deadline.
+    #[must_use]
+    pub fn with_trailing_hold(mut self, hold: Duration) -> Self {
+        self.trailing_hold = hold;
+        self
     }
 }
 
@@ -176,7 +216,20 @@ impl ProviderAdapter for StreamStubAdapter {
         >,
         ProviderError,
     > {
-        Ok(Box::pin(futures::stream::iter(self.chunks.clone())))
+        let chunks = self.chunks.clone();
+        let inter_chunk_delay = self.inter_chunk_delay;
+        let trailing_hold = self.trailing_hold;
+        Ok(Box::pin(stream! {
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                if index > 0 && !inter_chunk_delay.is_zero() {
+                    tokio::time::sleep(inter_chunk_delay).await;
+                }
+                yield chunk;
+            }
+            if !trailing_hold.is_zero() {
+                tokio::time::sleep(trailing_hold).await;
+            }
+        }))
     }
 
     fn metadata(&self) -> &ProviderMetadata {

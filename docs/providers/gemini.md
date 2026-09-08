@@ -61,6 +61,42 @@ include the full conversation history per the
 
 ---
 
+## Token accounting
+
+Gemini's two usage axes point in **opposite** directions, and this is the one provider where the
+reasoning axis differs from OpenAI and Anthropic. The gateway declares both once, in
+`src/providers/gemini/translate.rs`.
+
+| Axis | Semantics | Source |
+|---|---|---|
+| Cache | `promptTokenCount` **contains** `cachedContentTokenCount` | `ai.google.dev/api/generate-content` — `promptTokenCount` is "the total effective prompt size meaning this includes the number of tokens in the cached content" |
+| Reasoning | `candidatesTokenCount` **excludes** `thoughtsTokenCount` | same page — `totalTokenCount` is "prompt + thoughts + response candidates", so thoughts sit outside the candidates count |
+
+Two consequences follow, and they pull in different directions:
+
+- **Cached tokens are carved out of the reported prompt** before the remainder is charged at the
+  full input rate, then charged once at the cache rate. They are also counted **once**, not twice,
+  when selecting the long-context pricing tier — double-counting them could push a request into a
+  higher-priced tier it does not belong in.
+- **Thought tokens are charged beside the candidates total, not carved out of it.** Applying the
+  OpenAI or Anthropic treatment here would subtract a quantity that was never included, producing
+  an *undercharge*. This asymmetry is why the accounting is declared per provider rather than as
+  one global rule.
+
+### Cache-read rate
+
+The applicable Gemini and Vertex entries in the bundled pricing snapshot carry model-specific
+`cache_read_multiplier` values, so cached tokens are charged at each model's own discounted rate
+rather than at the full input rate. Operators overriding pricing can set `cache_read_multiplier`
+per tier.
+
+An entry that carries no multiplier — an operator override that omits it, or a model the snapshot
+does not price for cache reads — charges cached tokens at 1.0× the tier's input rate. A **positive**
+cached quantity priced that way reports a cost status of `rate-fallback`, so a missing discount is
+visible rather than silent; a reported zero has nothing to misprice and does not degrade the status.
+
+---
+
 ## Embeddings
 
 The Gemini adapter supports `POST /v1/embeddings` with automatic single/batch dispatch.
@@ -112,6 +148,8 @@ All requests use `taskType: "RETRIEVAL_DOCUMENT"` (constant `GEMINI_DEFAULT_TASK
 
 | Date | Change |
 |------|--------|
+| 2026-09-03 | Model-specific cache-read multipliers imported into the bundled pricing snapshot. Cached prompt tokens are charged at their discounted rate instead of the full input rate |
+| 2026-08-23 | Cached prompt tokens no longer charged twice, and no longer double-counted for tier selection. Cost drops sharply on cached prompts |
 | 2026-05-09 | batchEmbedContents, embed_api_version, tokenCount parsing, EmbeddingCapabilities |
 | 2026-05-06 | F4: gateway-level validation for missing/empty/orphaned `tool_call_id` |
 | 2026-05-05 | Tool use translation |

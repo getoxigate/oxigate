@@ -20,6 +20,10 @@ use oxigate::config::BudgetDuration;
 use oxigate::domain::chat::{StreamChunk, Usage};
 use oxigate::domain::ports::NanoUsd;
 use oxigate::domain::spend::SpendRecord;
+use oxigate::domain::usage_accounting::{
+    CacheWriteClass, CacheWriteEvidence, CostStatus, EVIDENCE_SCHEMA_VERSION, EvidenceEntry,
+    ReconciliationOutcome, UsageEvidence,
+};
 use oxigate::redis_pool::create_pool;
 
 use chrono_tz::UTC;
@@ -34,18 +38,21 @@ fn make_record(org: &str, id: &str, cost: i64) -> SpendRecord {
         prompt_tokens: 100,
         completion_tokens: 50,
         cache_read_tokens: 0,
-        cache_write_5m_tokens: 0,
-        cache_write_1h_tokens: 0,
         thinking_tokens: 0,
         cost_nano_usd: NanoUsd::from_i64(cost),
+        cost_status: CostStatus::Exact,
+        usage_evidence: None,
         latency_ms: 42,
         tags: serde_json::Value::Object(serde_json::Map::new()),
     }
 }
 
 /// write_spend inserts a row into spend_records with correct field values,
-/// including the split cache-write columns, thinking_tokens, latency_ms,
-/// and tags (JSONB round-trip).
+/// including cost_status, thinking_tokens, latency_ms, and tags (JSONB round-trip).
+///
+/// AC25: this record carries no cache-write evidence, so `usage_evidence` must persist as SQL
+/// NULL rather than an empty JSON document, while `cost_status` — a fact about the whole
+/// request, not about cache-write specifically — stays queryable regardless.
 #[tokio::test]
 async fn test_write_spend_inserts_row() {
     let pg = PgContainer::start().await.expect("pg container");
@@ -63,10 +70,10 @@ async fn test_write_spend_inserts_row() {
         prompt_tokens: 100,
         completion_tokens: 50,
         cache_read_tokens: 3,
-        cache_write_5m_tokens: 15,
-        cache_write_1h_tokens: 8,
         thinking_tokens: 12,
         cost_nano_usd: NanoUsd(1_500_000_000),
+        cost_status: CostStatus::Exact,
+        usage_evidence: None,
         latency_ms: 42,
         tags: serde_json::json!({"team": "ml"}),
     };
@@ -83,14 +90,12 @@ async fn test_write_spend_inserts_row() {
         i64,
         i64,
         i64,
-        i64,
-        i64,
+        String,
         i32,
     ) = sqlx::query_as(
         "SELECT org_id, identity_id, model, provider, \
              prompt_tokens, completion_tokens, cost_nano_usd, \
-             cache_write_5m_tokens, cache_write_1h_tokens, \
-             thinking_tokens, cache_read_tokens, latency_ms \
+             thinking_tokens, cache_read_tokens, cost_status, latency_ms \
              FROM spend_records LIMIT 1",
     )
     .fetch_one(&pg.pool)
@@ -104,11 +109,22 @@ async fn test_write_spend_inserts_row() {
     assert_eq!(row.4, 100); // prompt_tokens
     assert_eq!(row.5, 50); // completion_tokens
     assert_eq!(row.6, 1_500_000_000); // cost_nano_usd
-    assert_eq!(row.7, 15); // cache_write_5m_tokens
-    assert_eq!(row.8, 8); // cache_write_1h_tokens
-    assert_eq!(row.9, 12); // thinking_tokens
-    assert_eq!(row.10, 3); // cache_read_tokens
-    assert_eq!(row.11, 42); // latency_ms
+    assert_eq!(row.7, 12); // thinking_tokens
+    assert_eq!(row.8, 3); // cache_read_tokens
+    assert_eq!(row.9, "exact"); // cost_status
+    assert_eq!(row.10, 42); // latency_ms
+
+    // AC25: a request with no cache-write evidence stores SQL NULL, not an empty JSON value —
+    // and the row's request-wide cost_status stays queryable independent of that NULL.
+    let evidence: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT usage_evidence FROM spend_records LIMIT 1")
+            .fetch_one(&pg.pool)
+            .await
+            .expect("usage_evidence query");
+    assert_eq!(
+        evidence, None,
+        "no-cache-write row must store SQL NULL evidence, not an empty document"
+    );
 
     let tags: serde_json::Value = sqlx::query_scalar("SELECT tags FROM spend_records LIMIT 1")
         .fetch_one(&pg.pool)
@@ -117,6 +133,89 @@ async fn test_write_spend_inserts_row() {
     assert_eq!(
         tags["team"], "ml",
         "tags JSONB must round-trip through Postgres",
+    );
+}
+
+/// AC26: a positive cache-write row's `usage_evidence` round-trips through Postgres JSONB as the
+/// exact typed document that was written — every field, not only a summary of it — and a
+/// non-default `cost_status` survives alongside it unchanged.
+///
+/// This is a negative control by construction: if `spend_writer::write_spend` stopped binding
+/// `usage_evidence` (or bound something else, e.g. a placeholder or a re-derived summary), the
+/// `serde_json::from_value` below would fail outright (NULL has no `schema_version` to
+/// deserialize) or the `assert_eq!` against the original typed document would fail on whichever
+/// field diverged.
+#[tokio::test]
+async fn test_write_spend_positive_cache_write_evidence_round_trips_through_jsonb() {
+    let pg = PgContainer::start().await.expect("pg container");
+    let redis = RedisContainer::start().await.expect("redis container");
+
+    let pool = Arc::new(RwLock::new(pg.pool.clone()));
+    let rp = Arc::new(RwLock::new(redis.pool.clone()));
+
+    // A nontrivial document: two retained entries (one configured class, one unknown), a
+    // contradiction between the aggregate and detail views, and every scalar meaning AC26 lists.
+    let evidence = UsageEvidence {
+        schema_version: EVIDENCE_SCHEMA_VERSION,
+        cache_write: CacheWriteEvidence {
+            reported_tokens: 150,
+            detail_tokens: 130,
+            accounted_tokens: 150,
+            component_cost_nano_usd: 9_000,
+            reconciliation: ReconciliationOutcome::AggregateExceedsDetail,
+            unknown_duplicates_indeterminate: true,
+            quantity_overflow: false,
+            entries: vec![
+                EvidenceEntry {
+                    raw_key: "cache_creation_5m_tokens".into(),
+                    canonical_class: CacheWriteClass::canonicalize("5m"),
+                    tokens: 100,
+                },
+                EvidenceEntry {
+                    raw_key: "cache_creation_unrecognized_tokens".into(),
+                    canonical_class: None,
+                    tokens: 30,
+                },
+            ],
+            incomplete: true,
+        },
+    };
+
+    let record = SpendRecord {
+        org_id: "acme".into(),
+        identity_id: "key-evidence".into(),
+        model: "claude-sonnet-4-6".into(),
+        provider: "anthropic".into(),
+        prompt_tokens: 1_000,
+        completion_tokens: 200,
+        cache_read_tokens: 0,
+        thinking_tokens: 0,
+        cost_nano_usd: NanoUsd(2_500_000_000),
+        cost_status: CostStatus::RateFallback,
+        usage_evidence: Some(evidence.clone()),
+        latency_ms: 55,
+        tags: serde_json::Value::Object(serde_json::Map::new()),
+    };
+    oxigate::db::spend_writer::write_spend(record, pool, rp, BudgetDuration::None, UTC, Utc::now())
+        .await;
+
+    let row: (serde_json::Value, String) = sqlx::query_as(
+        "SELECT usage_evidence, cost_status FROM spend_records WHERE identity_id = 'key-evidence'",
+    )
+    .fetch_one(&pg.pool)
+    .await
+    .expect("row must exist with non-NULL usage_evidence");
+
+    let round_tripped: UsageEvidence =
+        serde_json::from_value(row.0).expect("usage_evidence must deserialize as UsageEvidence");
+    assert_eq!(
+        round_tripped, evidence,
+        "the complete typed document — schema version, reported/detail/accounted tokens, \
+         component cost, reconciliation, entries and incomplete — must round-trip unchanged"
+    );
+    assert_eq!(
+        row.1, "rate-fallback",
+        "a non-default cost_status must round-trip unchanged alongside the evidence"
     );
 }
 
@@ -156,6 +255,99 @@ async fn test_write_spend_increments_redis() {
         .await
         .expect("GET");
     assert_eq!(val, 3_000, "Redis counter must be sum of both writes");
+}
+
+/// AC27 (budget half): the Redis budget counter is incremented by `cost_nano_usd` alone —
+/// evidence completeness must not change the amount `write_spend` credits.
+///
+/// Two records carry the identical cost but differ only in `usage_evidence.cache_write.incomplete`
+/// (one `false`, one `true`), written to distinct identities so each counter reflects exactly one
+/// write. Negative control: if a future change let the Redis increment read evidence completeness
+/// (a second authority this module must never introduce), the two counters below would diverge.
+#[tokio::test]
+async fn test_write_spend_redis_increment_unaffected_by_evidence_completeness() {
+    let pg = PgContainer::start().await.expect("pg container");
+    let redis = RedisContainer::start().await.expect("redis container");
+
+    let pool = Arc::new(RwLock::new(pg.pool.clone()));
+    let rp = Arc::new(RwLock::new(redis.pool.clone()));
+
+    let evidence_of = |incomplete: bool| UsageEvidence {
+        schema_version: EVIDENCE_SCHEMA_VERSION,
+        cache_write: CacheWriteEvidence {
+            reported_tokens: 200,
+            detail_tokens: 200,
+            accounted_tokens: 200,
+            component_cost_nano_usd: 300,
+            reconciliation: ReconciliationOutcome::Consistent,
+            unknown_duplicates_indeterminate: false,
+            quantity_overflow: false,
+            entries: Vec::new(),
+            incomplete,
+        },
+    };
+
+    let mut complete_record = make_record("evi-org", "evi-complete", 4_000);
+    complete_record.usage_evidence = Some(evidence_of(false));
+    let mut incomplete_record = make_record("evi-org", "evi-incomplete", 4_000);
+    incomplete_record.usage_evidence = Some(evidence_of(true));
+
+    // Sanity: the two records genuinely differ in evidence completeness — otherwise the
+    // comparison below would pass vacuously.
+    assert_ne!(
+        complete_record
+            .usage_evidence
+            .as_ref()
+            .expect("evidence")
+            .cache_write
+            .incomplete,
+        incomplete_record
+            .usage_evidence
+            .as_ref()
+            .expect("evidence")
+            .cache_write
+            .incomplete,
+    );
+
+    oxigate::db::spend_writer::write_spend(
+        complete_record,
+        Arc::clone(&pool),
+        Arc::clone(&rp),
+        BudgetDuration::None,
+        UTC,
+        Utc::now(),
+    )
+    .await;
+    oxigate::db::spend_writer::write_spend(
+        incomplete_record,
+        Arc::clone(&pool),
+        Arc::clone(&rp),
+        BudgetDuration::None,
+        UTC,
+        Utc::now(),
+    )
+    .await;
+
+    let mut conn = redis.pool.get().await.expect("redis conn");
+    let complete_val: i64 = redis::cmd("GET")
+        .arg("oxigate:org:evi-org:spend:evi-complete")
+        .query_async(&mut *conn)
+        .await
+        .expect("GET complete counter");
+    let incomplete_val: i64 = redis::cmd("GET")
+        .arg("oxigate:org:evi-org:spend:evi-incomplete")
+        .query_async(&mut *conn)
+        .await
+        .expect("GET incomplete counter");
+
+    assert_eq!(
+        complete_val, 4_000,
+        "the complete-evidence record must credit the full cost"
+    );
+    assert_eq!(
+        complete_val, incomplete_val,
+        "evidence completeness must not change the amount credited to the budget counter"
+    );
 }
 
 /// after write_spend, Redis key has a TTL close to 60 days (within 5 s tolerance).
@@ -200,8 +392,8 @@ async fn test_seed_redis_from_db() {
 
     // Insert a row directly (bypassing write_spend).
     sqlx::query(
-        "INSERT INTO spend_records (org_id, identity_id, model, provider, cost_nano_usd) \
-         VALUES ('s-org', 's-id', 'gpt-4', 'openai', 9000)",
+        "INSERT INTO spend_records (org_id, identity_id, model, provider, cost_nano_usd, cost_status) \
+         VALUES ('s-org', 's-id', 'gpt-4', 'openai', 9000, 'exact')",
     )
     .execute(&pg.pool)
     .await
@@ -248,8 +440,8 @@ async fn test_seed_redis_period_keyed_monthly() {
     let redis = RedisContainer::start().await.expect("redis container");
 
     sqlx::query(
-        "INSERT INTO spend_records (org_id, identity_id, model, provider, cost_nano_usd) \
-         VALUES ('s-org', 's-id', 'gpt-4', 'openai', 9000)",
+        "INSERT INTO spend_records (org_id, identity_id, model, provider, cost_nano_usd, cost_status) \
+         VALUES ('s-org', 's-id', 'gpt-4', 'openai', 9000, 'exact')",
     )
     .execute(&pg.pool)
     .await
@@ -340,8 +532,8 @@ async fn test_seed_redis_explicit_reset_at_unprefixed() {
     let redis = RedisContainer::start().await.expect("redis container");
 
     sqlx::query(
-        "INSERT INTO spend_records (org_id, identity_id, model, provider, cost_nano_usd) \
-         VALUES ('s-org', 's-id', 'gpt-4', 'openai', 9000)",
+        "INSERT INTO spend_records (org_id, identity_id, model, provider, cost_nano_usd, cost_status) \
+         VALUES ('s-org', 's-id', 'gpt-4', 'openai', 9000, 'exact')",
     )
     .execute(&pg.pool)
     .await

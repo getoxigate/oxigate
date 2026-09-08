@@ -5,6 +5,7 @@
 //! Each submodule contains tests for a specific area (db_migrations, redis_pool, etc.).
 
 mod auth;
+mod bedrock_cache_e2e;
 mod budget_e2e;
 #[cfg(feature = "test-hooks")]
 mod budget_period_reset;
@@ -31,5 +32,6 @@ mod spend_e2e;
 mod spend_writer;
 mod stream_timeout_e2e;
 mod streaming;
+mod streaming_finalization;
 mod tagger_e2e;
 mod team_tag_budget_e2e;

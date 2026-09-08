@@ -168,9 +168,8 @@ pub async fn write_spend(
             r#"
             INSERT INTO spend_records
                 (org_id, identity_id, model, provider,
-                 prompt_tokens, completion_tokens, cache_read_tokens,
-                 cache_write_5m_tokens, cache_write_1h_tokens, thinking_tokens,
-                 cost_nano_usd, latency_ms, tags)
+                 prompt_tokens, completion_tokens, cache_read_tokens, thinking_tokens,
+                 cost_nano_usd, cost_status, usage_evidence, latency_ms, tags)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
@@ -181,10 +180,10 @@ pub async fn write_spend(
         .bind(record.prompt_tokens)
         .bind(record.completion_tokens)
         .bind(record.cache_read_tokens)
-        .bind(record.cache_write_5m_tokens)
-        .bind(record.cache_write_1h_tokens)
         .bind(record.thinking_tokens)
         .bind(record.cost_nano_usd.as_i64())
+        .bind(record.cost_status.as_str())
+        .bind(record.usage_evidence.as_ref().map(sqlx::types::Json))
         .bind(record.latency_ms)
         .bind(&record.tags)
         .execute(&db)

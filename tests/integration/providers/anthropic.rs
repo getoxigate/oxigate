@@ -12,6 +12,8 @@ use oxigate::providers::AnthropicAdapter;
 use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::bundled_pricing_holder;
+
 fn anthropic_chat_response(
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -56,7 +58,7 @@ async fn test_anthropic_chat_completion_non_streaming() {
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -105,7 +107,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
 data: {"type":"content_block_stop","index":0}
 
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"output_tokens":1}}
 
 data: {"type":"message_stop"}
 
@@ -123,7 +125,7 @@ data: {"type":"message_stop"}
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -173,7 +175,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
 data: {"type":"content_block_stop","index":0}
 
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":3,"output_tokens":2}}
 
 data: {"type":"message_stop"}
 
@@ -189,7 +191,7 @@ data: {"type":"message_stop"}
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -240,7 +242,7 @@ async fn test_anthropic_429_preserves_retry_after() {
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -283,7 +285,7 @@ async fn test_anthropic_529_is_retriable() {
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -327,7 +329,7 @@ async fn test_anthropic_auth_headers_sent() {
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -377,7 +379,7 @@ async fn test_anthropic_cache_tokens_surfaced() {
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -411,7 +413,7 @@ async fn test_anthropic_streaming_cache_tokens() {
 data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}
 data: {"type":"content_block_stop","index":0}
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":50}}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":50}}
 data: {"type":"message_stop"}
 "#;
     Mock::given(method("POST"))
@@ -426,7 +428,7 @@ data: {"type":"message_stop"}
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -482,7 +484,7 @@ async fn test_anthropic_tool_use_non_streaming() {
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -544,7 +546,7 @@ async fn test_anthropic_thinking_tokens_non_streaming() {
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -594,7 +596,7 @@ async fn test_anthropic_streaming_tool_use() {
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\": \\\"NYC\\\"\"}}\n\n",
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"}\"}}\n\n",
         "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":8,\"output_tokens\":12}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":8,\"output_tokens\":12}}\n\n",
         "data: {\"type\":\"message_stop\"}\n\n",
     );
     Mock::given(method("POST"))
@@ -609,7 +611,7 @@ async fn test_anthropic_streaming_tool_use() {
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -745,7 +747,7 @@ async fn test_anthropic_non_streaming_tool_buffer_overflow() {
 
     let mut config = anthropic_config(mock.uri().trim_end_matches('/'));
     config.tool_call_buffer_cap_bytes = Some(3);
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -804,7 +806,7 @@ async fn test_anthropic_streaming_tool_buffer_overflow() {
 
     let mut config = anthropic_config(mock.uri().trim_end_matches('/'));
     config.tool_call_buffer_cap_bytes = Some(3);
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -858,7 +860,7 @@ data: {"type":"content_block_stop","index":0}
 data: {"type":"content_block_start","index":1,"content_block":{"type":"text"}}
 data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"The answer is 42."}}
 data: {"type":"content_block_stop","index":1}
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":25,"output_tokens_details":{"thinking_tokens":15}}}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":5,"output_tokens":25,"output_tokens_details":{"thinking_tokens":15}}}
 data: {"type":"message_stop"}
 "#;
     Mock::given(method("POST"))
@@ -874,7 +876,7 @@ data: {"type":"message_stop"}
         .await;
 
     let config = anthropic_config(mock.uri().trim_end_matches('/'));
-    let adapter = AnthropicAdapter::new(config)
+    let adapter = AnthropicAdapter::new(config, bundled_pricing_holder())
         .await
         .expect("adapter must build");
 

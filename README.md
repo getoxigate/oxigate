@@ -61,7 +61,7 @@ accounting, tagging, and routing — in microseconds.
 | Fallback + retry with exponential backoff | ✅ |
 | Config-based auth (single Bearer token) | ✅ |
 | YAML config + env var overrides + SIGHUP hot-reload | ✅ |
-| Health checks (`/health/ready`, `/health/live`) | ✅ |
+| Health checks (`/health`, `/health/ready`) | ✅ |
 | Per-key API key management | planned |
 | Rate limiting (RPM / TPM) | planned |
 | Plugin system (Rust `.so` + Python) | planned |
@@ -120,6 +120,7 @@ X-Oxigate-Request-Cost: 0.000003
 X-Oxigate-Input-Tokens: 10
 X-Oxigate-Output-Tokens: 25
 X-Oxigate-Model-Used: gpt-4o-mini
+X-Oxigate-Cost-Status: exact
 ```
 
 ### Build from source
@@ -136,6 +137,33 @@ cp .env.example .env
 # Start the gateway — database migrations run automatically on startup
 cargo run --release --bin oxigate -- --config config/oxigate.yaml
 ```
+
+### Upgrading from v0.1.0
+
+**The `spend_records` schema changed after v0.1.0, and the change was made to the existing
+`0001_initial_schema.sql` rather than added as a follow-on migration.** `sqlx` checksums every
+migration it has already applied, so a database created by v0.1.0 will fail the startup
+migration step with a version-mismatch error rather than upgrading in place.
+
+This is a deliberate one-time break while the schema is still settling before 1.0. If you are
+running v0.1.0, recreate the database:
+
+```bash
+# Docker Compose — drops the Postgres volume, then rebuilds the schema on next start
+docker compose down -v
+docker compose up -d --build
+
+# Or, against an existing Postgres instance:
+psql "$DATABASE_URL" -c 'DROP TABLE IF EXISTS spend_records, _sqlx_migrations;'
+```
+
+Historical spend rows do not survive this. Export anything you need first — the columns
+`cache_write_5m_tokens` and `cache_write_1h_tokens` are gone in the new schema, replaced by
+`cost_status` (how much confidence the cost carries) and `usage_evidence` (JSONB — how the
+cache-write tokens on the request were classified, and what they were priced at). Fresh installations are unaffected; there is nothing to do.
+
+From the first tagged release after this one, schema changes ship as new numbered migrations
+and apply in place.
 
 ---
 

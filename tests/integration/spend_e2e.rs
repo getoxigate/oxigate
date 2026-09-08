@@ -36,9 +36,9 @@ async fn seed_spend(
         INSERT INTO spend_records
             (org_id, identity_id, model, provider,
              prompt_tokens, completion_tokens,
-             cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, thinking_tokens,
-             cost_nano_usd, latency_ms, tags, created_at)
-        VALUES ($1, 'test-key', $2, $3, 10, 5, 0, 0, 0, 0, $4, 10, '{}', $5)
+             cache_read_tokens, thinking_tokens,
+             cost_nano_usd, cost_status, latency_ms, tags, created_at)
+        VALUES ($1, 'test-key', $2, $3, 10, 5, 0, 0, $4, 'exact', 10, '{}', $5)
         "#,
     )
     .bind(org_id)

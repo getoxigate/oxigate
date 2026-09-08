@@ -1,8 +1,12 @@
--- OxiGate initial schema: pgcrypto + spend_records with split cache-write columns.
+-- OxiGate initial schema: pgcrypto + spend_records with generalized cache-write accounting.
 -- Squashed from 0001_initial + 0002_spend_records.
 -- org_id included from day one for multi-tenancy isolation.
--- Granular token columns: split 5m/1h Anthropic cache-write tiers.
+-- Cache-write tokens are accounted by class in the application layer, not split into fixed
+-- SQL columns; the row carries a cost-confidence status and optional evidence document instead.
 -- All monetary values in nano-USD. All sentinel defaults = 'default'.
+-- NOTE: this file was revised in place after v0.1.0. A database created by v0.1.0 fails
+-- the startup migration on a checksum mismatch and must be recreated — see README,
+-- "Upgrading from v0.1.0".
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE spend_records (
@@ -14,10 +18,10 @@ CREATE TABLE spend_records (
     prompt_tokens           BIGINT      NOT NULL DEFAULT 0,
     completion_tokens       BIGINT      NOT NULL DEFAULT 0,
     cache_read_tokens       BIGINT      NOT NULL DEFAULT 0,
-    cache_write_5m_tokens   BIGINT      NOT NULL DEFAULT 0,
-    cache_write_1h_tokens   BIGINT      NOT NULL DEFAULT 0,
     thinking_tokens         BIGINT      NOT NULL DEFAULT 0,
     cost_nano_usd           BIGINT      NOT NULL DEFAULT 0,
+    cost_status             TEXT        NOT NULL,
+    usage_evidence          JSONB       NULL,
     latency_ms              INTEGER     NOT NULL DEFAULT 0,
     tags                    JSONB       NOT NULL DEFAULT '{}',
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now()

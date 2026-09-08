@@ -6,7 +6,7 @@
 //! `stream_options.include_usage: true` injection for non-zero streaming cost.
 //! Embeddings deferred to; tool use/vision deferred to.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -20,7 +20,11 @@ use crate::domain::ports::{
     ChatCompletionStream, HealthStatus, ProviderAdapter, ProviderAdapterExt, ProviderError,
     ProviderKind, ProviderMetadata,
 };
-use crate::providers::openai::utils::{map_status_to_provider_error, normalize_openai_usage};
+use crate::domain::pricing::{PricingDb, snapshot_pricing_context};
+use crate::domain::usage_accounting::PricingContext;
+use crate::providers::openai::utils::{
+    AZURE_ACCOUNTING, map_status_to_provider_error, normalize_openai_usage,
+};
 use crate::providers::openai_compat::{CompatHttpClient, make_compat_sse_stream};
 use crate::utils::provider_error::{classify_reqwest_error, sanitize_network_error};
 
@@ -38,17 +42,25 @@ pub struct AzureAdapter {
     metadata: ProviderMetadata,
     /// Pre-computed: `{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={version}`
     chat_url: String,
+    /// Hot-reload pricing holder. Each request clones one generation out of it before dispatch,
+    /// so the cache-write class registry a response is accounted against and the rates it is
+    /// priced with come from the same pricing database.
+    pricing_db: Arc<RwLock<PricingDb>>,
 }
 
 impl AzureAdapter {
-    /// Constructs the adapter from validated config and a shared HTTP client.
+    /// Constructs the adapter from validated config, a shared HTTP client and the pricing holder.
     ///
     /// `async` is intentional: managed-identity token fetch at startup (deferred) will
     /// require an async call here. Keeping the signature async avoids a breaking change
     /// to all call sites when that feature lands.
+    ///
+    /// `pricing_db` is the same hot-reload holder the cost calculator reads; the adapter needs it
+    /// to snapshot one pricing generation per request before dispatch.
     pub async fn new(
         config: AzureConfig,
         http: Arc<CompatHttpClient>,
+        pricing_db: Arc<RwLock<PricingDb>>,
     ) -> Result<Self, ProviderError> {
         let chat_url = format!(
             "{}/openai/deployments/{}/chat/completions?api-version={}",
@@ -79,7 +91,17 @@ impl AzureAdapter {
             http,
             metadata,
             chat_url,
+            pricing_db,
         })
+    }
+
+    /// Snapshots this request's pricing generation.
+    ///
+    /// Called once per request, before dispatch, on both paths — Azure's buffered and streamed
+    /// routes are different code, and a request must not be accounted against one generation on
+    /// one of them and another on the other.
+    fn pricing_context(&self) -> PricingContext {
+        snapshot_pricing_context(&self.pricing_db)
     }
 
     fn build_request(&self, body: impl Into<reqwest::Body>) -> reqwest::RequestBuilder {
@@ -100,6 +122,7 @@ fn parse_response(
     bytes: &[u8],
     req_model: &str,
     provider_name: &str,
+    pricing_context: &PricingContext,
 ) -> Result<ChatResponse, ProviderError> {
     // `usage` is optional — Azure can omit it; the wrapper lets us emit a zero-cost warning
     // instead of returning a deserialization error. `choices` uses `Vec<Choice>` directly
@@ -129,7 +152,7 @@ fn parse_response(
             Usage::default()
         }
     };
-    normalize_openai_usage(&mut usage);
+    normalize_openai_usage(&mut usage, AZURE_ACCOUNTING, Some(pricing_context));
 
     Ok(ChatResponse {
         id: parsed.id.unwrap_or_default(),
@@ -232,6 +255,7 @@ impl ProviderAdapter for AzureAdapter {
     async fn chat_completion(&self, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         let body =
             serde_json::to_vec(req).map_err(|e| ProviderError::Serialization(e.to_string()))?;
+        let pricing_context = self.pricing_context();
 
         let start = std::time::Instant::now();
         let resp = self
@@ -250,7 +274,7 @@ impl ProviderAdapter for AzureAdapter {
             .await
             .map_err(|e| ProviderError::Unreachable(sanitize_network_error(&e.to_string())))?;
 
-        parse_response(&bytes, &req.model, &self.config.name)
+        parse_response(&bytes, &req.model, &self.config.name, &pricing_context)
     }
 
     async fn chat_completion_stream(
@@ -263,6 +287,9 @@ impl ProviderAdapter for AzureAdapter {
 
         let body = serde_json::to_vec(&prepared)
             .map_err(|e| ProviderError::Serialization(e.to_string()))?;
+        // Snapshotted before dispatch and moved into the stream, so a reload landing before the
+        // terminal chunk cannot change what this request is accounted and priced against.
+        let pricing_context = self.pricing_context();
 
         let start = std::time::Instant::now();
         let resp = self
@@ -281,7 +308,12 @@ impl ProviderAdapter for AzureAdapter {
         // make_compat_sse_stream surfaces these as raw StreamChunk::Delta values; the
         // caller sees a non-error chunk with a refusal finish_reason, not ContentFiltered.
         // Full mid-stream content-filter mapping is deferred to.
-        Ok(make_compat_sse_stream(resp, self.config.name.clone()))
+        Ok(make_compat_sse_stream(
+            resp,
+            self.config.name.clone(),
+            AZURE_ACCOUNTING,
+            Some(pricing_context),
+        ))
     }
 
     fn metadata(&self) -> &ProviderMetadata {
@@ -319,6 +351,11 @@ mod tests {
         Arc::new(CompatHttpClient::new().expect("test http client"))
     }
 
+    /// The bundled pricing generation every Azure test adapter snapshots from.
+    fn make_pricing() -> Arc<RwLock<PricingDb>> {
+        fixture::pricing_holder()
+    }
+
     fn minimal_request() -> ChatRequest {
         ChatRequest {
             model: "gpt-4o".into(),
@@ -350,6 +387,7 @@ mod tests {
                 "2024-10-21",
             ),
             make_http(),
+            make_pricing(),
         )
         .await
         .unwrap();
@@ -368,6 +406,7 @@ mod tests {
                 "2024-10-21",
             ),
             make_http(),
+            make_pricing(),
         )
         .await
         .unwrap();
@@ -384,6 +423,7 @@ mod tests {
         let adapter = AzureAdapter::new(
             make_config("https://x.openai.azure.com", "d", "v"),
             make_http(),
+            make_pricing(),
         )
         .await
         .unwrap();
@@ -400,7 +440,9 @@ mod tests {
     async fn metadata_primary_when_supported_models_set() {
         let mut cfg = make_config("https://x.openai.azure.com", "d", "v");
         cfg.supported_models = Some(vec!["gpt-4o".to_string()]);
-        let adapter = AzureAdapter::new(cfg, make_http()).await.unwrap();
+        let adapter = AzureAdapter::new(cfg, make_http(), make_pricing())
+            .await
+            .unwrap();
         assert_eq!(adapter.metadata().kind, ProviderKind::Primary);
         assert_eq!(adapter.metadata().supported_models, vec!["gpt-4o"]);
     }
@@ -409,7 +451,9 @@ mod tests {
     async fn metadata_name_matches_config() {
         let mut cfg = make_config("https://x.openai.azure.com", "d", "v");
         cfg.name = "azure-prod".to_string();
-        let adapter = AzureAdapter::new(cfg, make_http()).await.unwrap();
+        let adapter = AzureAdapter::new(cfg, make_http(), make_pricing())
+            .await
+            .unwrap();
         assert_eq!(adapter.metadata().name, "azure-prod");
     }
 
@@ -555,6 +599,106 @@ mod tests {
         assert_eq!(
             opts.get("other_key").and_then(|v| v.as_str()),
             Some("value")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache-write accounting at the adapter seam
+    //
+    // Azure's two paths do not share a route: the buffered one parses the body here, the streamed
+    // one runs through `make_compat_sse_stream`. They are asserted separately, against the same
+    // fixture, because a per-lane value carried on one and not the other would bill a streamed
+    // request differently from an identical buffered one.
+    // -----------------------------------------------------------------------
+
+    use crate::providers::openai::utils::cache_write_fixture as fixture;
+
+    fn azure_config_for(mock_base: &str) -> AzureConfig {
+        let mut cfg = make_config(mock_base, "gpt-5-6-sol", "2024-10-21");
+        cfg.supported_models = Some(vec![fixture::MODEL.to_string()]);
+        cfg
+    }
+
+    fn cache_write_request() -> ChatRequest {
+        let mut req = minimal_request();
+        req.model = fixture::MODEL.to_string();
+        req
+    }
+
+    /// The deployment path Azure builds for [`azure_config_for`].
+    const DEPLOYMENT_PATH: &str = "/openai/deployments/gpt-5-6-sol/chat/completions";
+
+    /// Azure inherits the OpenAI cache-write behaviour on the buffered path.
+    #[tokio::test]
+    async fn azure_buffered_bills_a_cache_write_at_the_thirty_minute_rate() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(DEPLOYMENT_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": fixture::MODEL,
+                    "choices": [],
+                    "usage": fixture::usage_json(),
+                })),
+            )
+            .mount(&mock)
+            .await;
+
+        let adapter = AzureAdapter::new(azure_config_for(&mock.uri()), make_http(), make_pricing())
+            .await
+            .expect("adapter must build");
+        let resp = adapter
+            .chat_completion(&cache_write_request())
+            .await
+            .expect("chat must succeed");
+
+        fixture::assert_accounted_and_billed(&resp.usage);
+    }
+
+    /// The streamed path bills identically, through `make_compat_sse_stream`.
+    #[tokio::test]
+    async fn azure_streaming_bills_a_cache_write_at_the_thirty_minute_rate() {
+        let mock = wiremock::MockServer::start().await;
+        let sse = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": fixture::MODEL,
+                "choices": [],
+                "usage": fixture::usage_json(),
+            })
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(DEPLOYMENT_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse, "text/event-stream")
+                    .insert_header("Content-Type", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let adapter = AzureAdapter::new(azure_config_for(&mock.uri()), make_http(), make_pricing())
+            .await
+            .expect("adapter must build");
+        let mut stream = adapter
+            .chat_completion_stream(&cache_write_request())
+            .await
+            .expect("stream must open");
+
+        let mut last_usage: Option<Usage> = None;
+        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+            if let Some(u) = chunk.expect("no stream error").usage {
+                last_usage = Some(u);
+            }
+        }
+
+        fixture::assert_accounted_and_billed(
+            &last_usage.expect("the terminal chunk carries usage"),
         );
     }
 }

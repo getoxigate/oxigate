@@ -6,24 +6,26 @@
 //! Domain types are already OpenAI-shaped — minimal translation; focus on
 //! model-specific parameter handling (reasoning models) and error semantics.
 
-mod types;
 pub mod utils;
 
+use std::sync::{Arc, RwLock};
+
 use async_trait::async_trait;
-use futures::StreamExt;
 use secrecy::ExposeSecret;
-use tracing::debug;
 
 use crate::config::OpenAIConfig;
-use crate::domain::chat::{ChatRequest, ChatResponse, Role, Usage};
+use crate::domain::chat::{ChatRequest, ChatResponse, Role};
 use crate::domain::embedding::{EmbeddingRequest, EmbeddingResponse};
 use crate::domain::ports::{
     ChatCompletionStream, EmbeddingCapabilities, HealthStatus, ProviderAdapter, ProviderAdapterExt,
     ProviderError, ProviderKind, ProviderMetadata,
 };
-use crate::providers::openai::types::StreamChunkWithUsage;
-use crate::providers::openai::utils::{inject_stream_options, normalize_openai_usage};
-use crate::utils::provider_error::{classify_reqwest_error, sanitize_network_error};
+use crate::domain::pricing::{PricingDb, snapshot_pricing_context};
+use crate::domain::usage_accounting::PricingContext;
+use crate::providers::openai::utils::{
+    OPENAI_ACCOUNTING, inject_stream_options, normalize_openai_usage,
+};
+use crate::utils::provider_error::classify_reqwest_error;
 
 const OPENAI_API_BASE: &str = "https://api.openai.com";
 
@@ -135,11 +137,21 @@ pub struct OpenAiAdapter {
     metadata: ProviderMetadata,
     /// Validated bearer token, stored once at construction to avoid expect on hot path.
     api_key: String,
+    /// Hot-reload pricing holder. Each request clones one generation out of it before dispatch,
+    /// so the cache-write class registry a response is accounted against and the rates it is
+    /// priced with come from the same pricing database.
+    pricing_db: Arc<RwLock<PricingDb>>,
 }
 
 impl OpenAiAdapter {
     /// Creates an OpenAI adapter. Config must be validated by GatewayConfig::validate.
-    pub async fn new(config: OpenAIConfig) -> Result<Self, ProviderError> {
+    ///
+    /// `pricing_db` is the same hot-reload holder the cost calculator reads; the adapter needs it
+    /// to snapshot one pricing generation per request before dispatch.
+    pub async fn new(
+        config: OpenAIConfig,
+        pricing_db: Arc<RwLock<PricingDb>>,
+    ) -> Result<Self, ProviderError> {
         let api_key = config
             .api_key
             .as_ref()
@@ -189,7 +201,18 @@ impl OpenAiAdapter {
             http: client,
             metadata,
             api_key,
+            pricing_db,
         })
+    }
+
+    /// Snapshots this request's pricing generation.
+    ///
+    /// Called once per request, before the upstream request is dispatched, on the buffered path
+    /// as well as the streaming one: a buffered request dispatched under one database but
+    /// completing after a reload must not price against the next one while an equivalent stream
+    /// prices against the first.
+    fn pricing_context(&self) -> PricingContext {
+        snapshot_pricing_context(&self.pricing_db)
     }
 
     fn model(&self, req_model: &str) -> String {
@@ -246,6 +269,7 @@ impl ProviderAdapter for OpenAiAdapter {
     async fn chat_completion(&self, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         let model = self.model(&req.model);
         let prepared = prepare_request(req);
+        let pricing_context = self.pricing_context();
 
         let start = std::time::Instant::now();
         let resp = self
@@ -267,8 +291,13 @@ impl ProviderAdapter for OpenAiAdapter {
         // Ensure model in response matches request
         chat_resp.model = model.clone();
 
-        //: map prompt_tokens_details.cached_tokens → cache_read_input_tokens
-        normalize_openai_usage(&mut chat_resp.usage);
+        // Map prompt_tokens_details.cached_tokens → cache_read_input_tokens, and account
+        // cache_write_tokens against the generation snapshotted before dispatch.
+        normalize_openai_usage(
+            &mut chat_resp.usage,
+            OPENAI_ACCOUNTING,
+            Some(&pricing_context),
+        );
 
         Ok(chat_resp)
     }
@@ -284,6 +313,11 @@ impl ProviderAdapter for OpenAiAdapter {
         // If client explicitly set include_usage: false, respect it.
         inject_stream_options(&mut prepared);
 
+        // Snapshotted before dispatch and moved into the stream: the terminal chunk may arrive
+        // long after a reload, and it must be accounted and priced against the generation this
+        // request started under.
+        let pricing_context = self.pricing_context();
+
         let start = std::time::Instant::now();
         let resp = self
             .build_request(&prepared)
@@ -295,68 +329,16 @@ impl ProviderAdapter for OpenAiAdapter {
             return Err(self.map_error_response(resp.status(), resp).await);
         }
 
-        let mut stream = resp
-            .bytes_stream()
-            .map(|r| r.map_err(|e: reqwest::Error| std::io::Error::other(e.to_string())));
-
-        let s = async_stream::stream! {
-            let mut last_usage: Option<Usage> = None;
-            // Resolved model from SSE chunks. chat.rs uses first-wins semantics for CostHeader::MODEL_USED.
-            let mut resolved_model: Option<String> = None;
-
-            while let Some(chunk_res) = stream.next().await {
-                let data = match chunk_res {
-                    Ok(b) => b,
-                    Err(e) => {
-                        yield Err(ProviderError::Unreachable(format!(
-                            "openai: {}",
-                            sanitize_network_error(&e.to_string())
-                        )));
-                        break;
-                    }
-                };
-
-                // Parse for usage and model extraction (final chunk has "usage": {...})
-                if !data.is_empty() {
-                    let s = std::str::from_utf8(&data).unwrap_or_default();
-                    for line in s.lines() {
-                        let trimmed = line.trim();
-                        let json_str = trimmed.strip_prefix("data: ").unwrap_or(trimmed).trim();
-                        if json_str != "[DONE]"
-                            && !json_str.is_empty()
-                            && let Ok(parsed) = serde_json::from_str::<StreamChunkWithUsage>(json_str)
-                        {
-                            if let Some(ref m) = parsed.model {
-                                resolved_model = Some(m.clone());
-                            }
-                            if let Some(ref usage) = parsed.usage {
-                                let mut u = usage.clone();
-                                normalize_openai_usage(&mut u);
-                                last_usage = Some(u);
-                                debug!(
-                                    prompt_tokens = usage.prompt_tokens,
-                                    completion_tokens = usage.completion_tokens,
-                                    reasoning_tokens = ?usage
-                                        .completion_tokens_details
-                                        .as_ref()
-                                        .and_then(|d| d.reasoning_tokens),
-                                    "openai streaming usage extracted for cost tracking"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                yield Ok(crate::domain::chat::StreamChunk::new(
-                    data,
-                    last_usage.clone(),
-                    resolved_model.clone(),
-                ));
-            }
-
-        };
-
-        Ok(Box::pin(s))
+        // Shares the compat lane's carry-buffer SSE reassembly rather than re-parsing each raw
+        // `bytes_stream()` chunk independently: a JSON line split across a chunk boundary (TCP
+        // segmentation, a proxy rewriting frame sizes) silently failed `serde_json::from_str` and
+        // was dropped under the old per-chunk parse, including the terminal chunk carrying usage.
+        Ok(crate::providers::openai_compat::make_compat_sse_stream(
+            resp,
+            "openai".to_string(),
+            OPENAI_ACCOUNTING,
+            Some(pricing_context),
+        ))
     }
 
     async fn embeddings(&self, req: &EmbeddingRequest) -> Result<EmbeddingResponse, ProviderError> {
@@ -430,8 +412,10 @@ impl ProviderAdapterExt for OpenAiAdapter {}
 
 #[cfg(test)]
 mod tests {
+    use futures::StreamExt;
+
     use super::*;
-    use crate::domain::chat::{MessageContent, Role};
+    use crate::domain::chat::{MessageContent, Role, Usage};
 
     fn msg(role: Role, content: &str) -> crate::domain::chat::Message {
         crate::domain::chat::Message {
@@ -568,7 +552,9 @@ mod tests {
             organization: None,
             project: None,
         };
-        let adapter = OpenAiAdapter::new(config).await.expect("must build");
+        let adapter = OpenAiAdapter::new(config, fixture::pricing_holder())
+            .await
+            .expect("must build");
         let meta = adapter.metadata();
         assert_eq!(
             meta.supported_models,
@@ -608,7 +594,7 @@ mod tests {
             organization: None,
             project: None,
         };
-        let adapter = OpenAiAdapter::new(config)
+        let adapter = OpenAiAdapter::new(config, fixture::pricing_holder())
             .await
             .expect("adapter must build");
         let meta = adapter.metadata();
@@ -638,5 +624,206 @@ mod tests {
         let base = "https://custom.openai.proxy.example.com/";
         let url = format!("{}/v1/embeddings", base.trim_end_matches('/'));
         assert_eq!(url, "https://custom.openai.proxy.example.com/v1/embeddings");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache-write accounting at the adapter seam
+    //
+    // Driven through a mocked upstream rather than against `normalize_openai_usage`, because the
+    // question these answer is whether *this adapter* supplies its pricing generation. A helper
+    // test cannot tell a lane that passes its context from one that passes nothing.
+    // -----------------------------------------------------------------------
+
+    use crate::providers::openai::utils::cache_write_fixture as fixture;
+
+    fn cache_write_request() -> ChatRequest {
+        ChatRequest {
+            model: fixture::MODEL.into(),
+            messages: vec![msg(Role::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            tools: None,
+            parallel_tool_calls: None,
+            request_id: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn openai_config_for(mock_base: &str) -> OpenAIConfig {
+        OpenAIConfig {
+            api_key: Some(crate::config::SecretString::new("sk-test")),
+            default_model: Some(fixture::MODEL.into()),
+            api_base_url: Some(mock_base.to_string()),
+            timeout_secs: Some(10),
+            supported_models: None,
+            organization: None,
+            project: None,
+        }
+    }
+
+    /// The OpenAI adapter accounts `cache_write_tokens` as class `30m` on the buffered path.
+    #[tokio::test]
+    async fn openai_buffered_bills_a_cache_write_at_the_thirty_minute_rate() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": fixture::MODEL,
+                    "choices": [],
+                    "usage": fixture::usage_json(),
+                })),
+            )
+            .mount(&mock)
+            .await;
+
+        let adapter = OpenAiAdapter::new(
+            openai_config_for(mock.uri().trim_end_matches('/')),
+            fixture::pricing_holder(),
+        )
+        .await
+        .expect("adapter must build");
+        let resp = adapter
+            .chat_completion(&cache_write_request())
+            .await
+            .expect("chat must succeed");
+
+        fixture::assert_accounted_and_billed(&resp.usage);
+    }
+
+    /// The same seam on the SSE path, which normalizes inside the stream rather than after it.
+    #[tokio::test]
+    async fn openai_streaming_bills_a_cache_write_at_the_thirty_minute_rate() {
+        let mock = wiremock::MockServer::start().await;
+        let sse = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": fixture::MODEL,
+                "choices": [],
+                "usage": fixture::usage_json(),
+            })
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse, "text/event-stream")
+                    .insert_header("Content-Type", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let adapter = OpenAiAdapter::new(
+            openai_config_for(mock.uri().trim_end_matches('/')),
+            fixture::pricing_holder(),
+        )
+        .await
+        .expect("adapter must build");
+        let mut stream = adapter
+            .chat_completion_stream(&cache_write_request())
+            .await
+            .expect("stream must open");
+
+        let mut last_usage: Option<Usage> = None;
+        while let Some(chunk) = stream.next().await {
+            if let Some(u) = chunk.expect("no stream error").usage {
+                last_usage = Some(u);
+            }
+        }
+
+        fixture::assert_accounted_and_billed(
+            &last_usage.expect("the terminal chunk carries usage"),
+        );
+    }
+
+    /// The terminal SSE `data:` line carrying usage must survive being split across two
+    /// independent wire-level chunks — a real TCP segmentation or intermediary proxy can break a
+    /// line at any byte offset, not only on a `\n`. Before this adapter shared the compat lane's
+    /// carry-buffer reassembly, each raw `bytes_stream()` chunk was parsed independently and a
+    /// split line failed `serde_json::from_str` silently, dropping the usage it carried.
+    #[tokio::test]
+    async fn openai_streaming_reassembles_a_usage_line_split_across_wire_chunks() {
+        use async_stream::stream as async_stream_gen;
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::response::Response;
+        use axum::routing::post;
+        use bytes::Bytes;
+
+        let sse_line = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "chatcmpl-split",
+                "object": "chat.completion.chunk",
+                "model": fixture::MODEL,
+                "choices": [],
+                "usage": fixture::usage_json(),
+            })
+        );
+        let line_bytes = sse_line.into_bytes();
+        // Split inside the JSON body, not on a line boundary — the exact shape a per-chunk
+        // parser cannot reassemble.
+        let split_at = line_bytes.len() / 2;
+        let (first_half, second_half) = line_bytes.split_at(split_at);
+        let first_half = Bytes::from(first_half.to_vec());
+        let second_half = Bytes::from(second_half.to_vec());
+
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let first_half = first_half.clone();
+                let second_half = second_half.clone();
+                async move {
+                    let body = async_stream_gen! {
+                        yield Result::<Bytes, std::convert::Infallible>::Ok(first_half);
+                        yield Ok(second_half);
+                        yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+                    };
+                    Response::builder()
+                        .status(200)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test upstream");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let adapter = OpenAiAdapter::new(
+            openai_config_for(&format!("http://127.0.0.1:{port}")),
+            fixture::pricing_holder(),
+        )
+        .await
+        .expect("adapter must build");
+        let mut stream = adapter
+            .chat_completion_stream(&cache_write_request())
+            .await
+            .expect("stream must open");
+
+        let mut last_usage: Option<Usage> = None;
+        while let Some(chunk) = stream.next().await {
+            if let Some(u) = chunk.expect("no stream error").usage {
+                last_usage = Some(u);
+            }
+        }
+
+        fixture::assert_accounted_and_billed(
+            &last_usage.expect("usage must survive a wire-chunk split mid-line"),
+        );
     }
 }

@@ -13,12 +13,37 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::domain::chat::{
-    ChatRequest, ChatResponse, Choice, Message, MessageContent, Role, ToolCall, ToolCallFunction,
-    Usage,
+    CacheAccounting, ChatRequest, ChatResponse, Choice, Message, MessageContent,
+    ReasoningAccounting, Role, ToolCall, ToolCallFunction, Usage, UsageAccounting,
 };
 use crate::domain::ports::ProviderError;
 use crate::domain::tool_schema::{ToolChoiceKind, parse_tool_choice_value, truncate_for_error};
+use crate::domain::usage_accounting::{
+    CacheWriteAccounting, CacheWriteAccumulator, CacheWriteClass, PricingContext,
+};
 use crate::providers::tool_limits::{BEDROCK_MAX_TOOLS, TOOL_ARGS_MAX_BYTES};
+
+/// Token accounting declared by the AWS Bedrock Converse API contract.
+///
+/// Cache is **additive**:
+/// `docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html` states that "when prompt
+/// caching is enabled, the `inputTokens` field represents only the non-cached input tokens" and
+/// gives `total input tokens = inputTokens + cacheReadInputTokens + cacheWriteInputTokens`
+/// (accessed 2026-08-10).
+///
+/// This is the one declaration in the family that differs from what the gateway assumed. Both
+/// Converse construction sites previously inherited the cache-inclusive type default, which is
+/// wrong for this contract. It bills identically today only because neither site parses
+/// `cacheReadInputTokens`, so there is nothing for an inclusive reading to subtract — the
+/// declaration is corrected here, before the parsing that would make it live money.
+///
+/// Reasoning is `Additive`, the neutral value: neither Converse path parses a reasoning token
+/// count, so nothing is charged on that axis and no first-party reference has been captured for
+/// it. Capture one before this axis is relied upon.
+pub(crate) const BEDROCK_ACCOUNTING: UsageAccounting = UsageAccounting {
+    cache: CacheAccounting::Additive,
+    reasoning: ReasoningAccounting::Additive,
+};
 
 // Bedrock Converse stop reason values (AWS Converse API spec).
 pub(crate) mod bedrock_stop {
@@ -186,12 +211,39 @@ pub struct ConverseToolUse {
     pub input: serde_json::Value,
 }
 
+/// One entry of the Converse `cacheDetails` array.
+///
+/// A fixed-shape `{ttl, inputTokens}` pair, unlike the Anthropic Messages breakdown whose members
+/// are arbitrary object keys — which is why the derived `Deserialize` is sufficient here and no
+/// seeded parse is introduced. The array is bounded by the already-buffered response body.
 #[derive(Debug, Deserialize)]
+pub struct CacheDetail {
+    /// The cache duration this entry's tokens were written for, verbatim from the wire.
+    ///
+    /// Kept as the raw string: it is both the class to canonicalize and the evidence key, and a
+    /// value that names no known duration must stay legible in the persisted evidence rather than
+    /// being normalized into a guess.
+    pub ttl: String,
+    #[serde(rename = "inputTokens")]
+    pub input_tokens: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct ConverseUsage {
     #[serde(rename = "inputTokens")]
     pub input_tokens: u64,
     #[serde(rename = "outputTokens")]
     pub output_tokens: u64,
+    /// Tokens served from cache. Additive: not part of `inputTokens`.
+    #[serde(rename = "cacheReadInputTokens")]
+    pub cache_read_input_tokens: Option<u64>,
+    /// The provider's cache-write aggregate — an alternate view of `cacheDetails`, not an
+    /// addition to it.
+    #[serde(rename = "cacheWriteInputTokens")]
+    pub cache_write_input_tokens: Option<u64>,
+    /// The per-class breakdown of the cache write. Absent on API versions that predate it.
+    #[serde(rename = "cacheDetails")]
+    pub cache_details: Option<Vec<CacheDetail>>,
 }
 
 /// Translates an OxiGate `ChatRequest` to a Converse `ConverseRequest`.
@@ -379,10 +431,16 @@ fn stop_from_extra(extra: &serde_json::Map<String, Value>) -> Vec<String> {
 }
 
 /// Translates a Converse response to an OxiGate `ChatResponse`.
+///
+/// `pricing_context` is the generation the request was dispatched under, snapshotted before
+/// dispatch. Cache-write observations are credited against its class registry and the context is
+/// pinned onto the resulting accounting, so a reload landing while the request was in flight
+/// cannot change what it is priced against.
 pub fn converse_response_to_chat(
     resp: &ConverseResponse,
     model: &str,
     request_id: &str,
+    pricing_context: &PricingContext,
 ) -> ChatResponse {
     let mut text_parts: Vec<&str> = Vec::new();
     let mut tool_calls_out: Vec<ToolCall> = Vec::new();
@@ -422,17 +480,25 @@ pub fn converse_response_to_chat(
         .map(map_stop_reason)
         .map(String::from);
 
-    let (prompt_tokens, completion_tokens, total_tokens) = resp
-        .usage
-        .as_ref()
+    let usage = resp.usage.as_ref();
+    let (prompt_tokens, completion_tokens, total_tokens) = usage
         .map(|u| {
             (
                 u.input_tokens,
                 u.output_tokens,
+                // Deliberately excludes both cache buckets, matching the sibling Additive lane.
                 u.input_tokens + u.output_tokens,
             )
         })
         .unwrap_or((0, 0, 0));
+
+    let cache_write = converse_cache_write(
+        usage.and_then(|u| u.cache_write_input_tokens),
+        usage
+            .and_then(|u| u.cache_details.as_deref())
+            .unwrap_or_default(),
+        pricing_context,
+    );
 
     ChatResponse {
         id: format!("chatcmpl-{}", request_id),
@@ -453,9 +519,52 @@ pub fn converse_response_to_chat(
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_creation_input_tokens: cache_write.published_tokens(),
+            cache_read_input_tokens: usage.and_then(|u| u.cache_read_input_tokens),
+            accounting: BEDROCK_ACCOUNTING,
+            cache_write,
             ..Default::default()
         },
     }
+}
+
+/// Closes cache-write accounting for one Converse response, buffered or streamed.
+///
+/// Both Converse paths report the same three things — a per-class detail list, an aggregate, and
+/// nothing else — so both close accounting here. The two views are never summed:
+/// `accounted_tokens` takes the maximum, and details that fall short of the aggregate leave an
+/// unmatched residual priced at the tier fallback.
+///
+/// **An aggregate with no details gets no default class**, which is where this diverges from the
+/// Anthropic Messages path. AWS's default-TTL statement is about the *request* — a response that
+/// omits `cacheDetails` says nothing about what the request asked for — and AWS documents
+/// `cacheDetails` as empty only when no cache creation occurred. An aggregate reported without a
+/// breakdown is therefore an older API version, a non-conforming implementation, or an
+/// undocumented shape, and the tokens may well have been written for the longer duration.
+/// Crediting them to the shorter class would undercharge while reporting `exact`; leaving them as
+/// an unmatched residual overcharges visibly and reports `rate-fallback`, which is the true
+/// statement that no exact rate was established.
+///
+/// A `ttl` that does not canonicalize is one unknown class, never guessed at.
+pub(crate) fn converse_cache_write(
+    reported_aggregate: Option<u64>,
+    details: &[CacheDetail],
+    pricing_context: &PricingContext,
+) -> CacheWriteAccounting {
+    let mut accumulator = CacheWriteAccumulator::new(pricing_context.registry().clone());
+    for detail in details {
+        accumulator.observe_detail(
+            &detail.ttl,
+            CacheWriteClass::canonicalize(&detail.ttl),
+            detail.input_tokens,
+        );
+    }
+    if let Some(total) = reported_aggregate {
+        accumulator.set_reported_aggregate(total);
+    }
+    let mut accounting = accumulator.finish();
+    accounting.set_pricing_context(pricing_context.clone());
+    accounting
 }
 
 /// Builds the Bedrock `toolConfig` from a `ChatRequest`.
@@ -540,7 +649,467 @@ pub fn map_stop_reason(stop_reason: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PricingConfig;
     use crate::domain::chat::Message;
+    use crate::domain::pricing::{BUNDLED_PRICING_JSON, PricingDb};
+    use crate::domain::usage_accounting::{CostStatus, FinalizedAccounting};
+
+    /// A minimal successful `ConverseResponse` carrying the given usage.
+    ///
+    /// The accounting tests below care only about the usage numbers, so the message body is fixed
+    /// and shared — two copies of it would let the pair drift on a field neither test is about.
+    fn converse_response(input_tokens: u64, output_tokens: u64) -> ConverseResponse {
+        converse_response_with_usage(ConverseUsage {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        })
+    }
+
+    /// The same fixed message body, carrying a caller-supplied usage payload.
+    fn converse_response_with_usage(usage: ConverseUsage) -> ConverseResponse {
+        ConverseResponse {
+            output: ConverseOutput {
+                message: ConverseOutputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![ConverseOutputBlock {
+                        text: Some("hi".to_string()),
+                        ..Default::default()
+                    }],
+                },
+            },
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(usage),
+        }
+    }
+
+    /// A pricing context over the bundled snapshot — the same database the gateway ships and
+    /// prices with, so the class registry these tests account against is the production one.
+    fn test_pricing_context() -> PricingContext {
+        crate::domain::pricing::snapshot_pricing_context(&bundled_pricing_holder())
+    }
+
+    fn bundled_pricing_holder() -> std::sync::Arc<std::sync::RwLock<PricingDb>> {
+        std::sync::Arc::new(std::sync::RwLock::new(
+            PricingDb::load(BUNDLED_PRICING_JSON, &PricingConfig::default())
+                .expect("bundled pricing must load"),
+        ))
+    }
+
+    fn detail(ttl: &str, input_tokens: u64) -> CacheDetail {
+        CacheDetail {
+            ttl: ttl.to_string(),
+            input_tokens,
+        }
+    }
+
+    /// The Converse contract's accounting reaches the non-stream construction site.
+    ///
+    /// The streaming site in `bedrock/mod.rs` applies the same constant; the two are checked
+    /// separately because they are separate literals until they are collapsed.
+    #[test]
+    fn test_converse_response_declares_bedrock_accounting() {
+        let converse_resp = converse_response(5_000, 500);
+        let chat = converse_response_to_chat(
+            &converse_resp,
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "req-001",
+            &test_pricing_context(),
+        );
+
+        assert_eq!(chat.usage.accounting, BEDROCK_ACCOUNTING);
+        assert_eq!(chat.usage.accounting.cache, CacheAccounting::Additive);
+    }
+
+    /// Correcting the declaration moves no billed amount, because neither Converse path parses a
+    /// cache-read token count: there is nothing for the previous cache-inclusive reading to
+    /// subtract, so both readings price the same prompt.
+    ///
+    /// This is what makes it safe to correct the declaration ahead of the parsing work. It stops
+    /// being true the moment those buckets are populated — which is exactly why the declaration
+    /// is corrected first.
+    #[test]
+    fn test_bedrock_declaration_correction_moves_no_cost() {
+        use crate::utils::cost_headers::build_cost_headers;
+
+        let converse_resp = converse_response(5_000, 500);
+        let model = "anthropic.claude-3-5-sonnet-20241022-v2:0";
+        let corrected =
+            converse_response_to_chat(&converse_resp, model, "req-001", &test_pricing_context())
+                .usage;
+
+        assert_eq!(
+            corrected.cache_read_input_tokens, None,
+            "no cache-read bucket is parsed on this path"
+        );
+        assert!(corrected.prompt_tokens_details.is_none());
+
+        // The pre-correction reading, reconstructed: everything identical but cache-inclusive.
+        let previous = Usage {
+            accounting: UsageAccounting {
+                cache: CacheAccounting::Inclusive,
+                ..corrected.accounting
+            },
+            ..corrected.clone()
+        };
+
+        let (_, corrected_finalized) =
+            build_cost_headers(model, &corrected, bundled_pricing_holder(), false);
+        let (_, previous_finalized) =
+            build_cost_headers(model, &previous, bundled_pricing_holder(), false);
+        let (corrected_cost, corrected_tokens) =
+            (&corrected_finalized.cost, &corrected_finalized.token_usage);
+        let (previous_cost, previous_tokens) =
+            (&previous_finalized.cost, &previous_finalized.token_usage);
+
+        assert_eq!(corrected_cost.total_cost, previous_cost.total_cost);
+        assert_eq!(corrected_cost.input_cost, previous_cost.input_cost);
+        assert_eq!(
+            corrected_cost.cached_input_cost,
+            previous_cost.cached_input_cost
+        );
+        assert_eq!(corrected_tokens.input_tokens, previous_tokens.input_tokens);
+        assert_eq!(
+            corrected_tokens.context_input_tokens(),
+            previous_tokens.context_input_tokens(),
+            "the tier comparator must not move either"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Cache-write accounting on the buffered path
+    // -----------------------------------------------------------------------------------------
+
+    /// The bundled Bedrock entry, the only one these cost assertions can be written against.
+    const PRICED_MODEL: &str = "anthropic.claude-sonnet-4-6";
+
+    /// Finalizes a Converse response the way the request path does, and returns its usage and
+    /// finalization together — the pair every cost, status and spend assertion below reads from.
+    fn finalize(usage: ConverseUsage) -> (Usage, FinalizedAccounting) {
+        let (usage, _, finalized) = finalize_with_headers(usage);
+        (usage, finalized)
+    }
+
+    /// The same finalization, keeping the emitted headers — used where a surface, not just a
+    /// number, is what is under test.
+    fn finalize_with_headers(
+        usage: ConverseUsage,
+    ) -> (Usage, axum::http::header::HeaderMap, FinalizedAccounting) {
+        use crate::utils::cost_headers::build_cost_headers;
+
+        let resp = converse_response_with_usage(usage);
+        let chat =
+            converse_response_to_chat(&resp, PRICED_MODEL, "req-cache", &test_pricing_context());
+        let (headers, finalized) =
+            build_cost_headers(PRICED_MODEL, &chat.usage, bundled_pricing_holder(), false);
+        (chat.usage, headers, finalized)
+    }
+
+    fn class_tokens(usage: &Usage, class: &str) -> u64 {
+        usage
+            .cache_write
+            .class_totals()
+            .iter()
+            .find(|t| t.class.as_str() == class)
+            .map_or(0, |t| t.tokens)
+    }
+
+    /// Per-class details are credited to their canonical classes, the aggregate is the reported
+    /// view of the same quantity rather than an addition to it, and the read bucket arrives.
+    #[test]
+    fn test_bedrock_buffered_credits_cache_details_per_class() {
+        let (usage, finalized) = finalize(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cache_read_input_tokens: Some(2_000),
+            cache_write_input_tokens: Some(1_500),
+            cache_details: Some(vec![detail("5m", 1_000), detail("1h", 500)]),
+        });
+
+        assert_eq!(usage.cache_read_input_tokens, Some(2_000));
+        assert_eq!(
+            usage.cache_creation_input_tokens,
+            Some(1_500),
+            "the published quantity is the accounted one, not the sum of both views"
+        );
+        assert_eq!(class_tokens(&usage, "5m"), 1_000);
+        assert_eq!(class_tokens(&usage, "1h"), 500);
+        assert_eq!(usage.cache_write.fallback_tokens(), 0);
+        assert!(usage.cache_write.partition_is_exact());
+        assert_eq!(finalized.cost.status, CostStatus::Exact);
+    }
+
+    /// A positive aggregate with no detail breakdown is an unmatched residual, not a write to the
+    /// contract's shorter default class.
+    ///
+    /// A Converse response omitting `cacheDetails` says nothing about the TTL the request asked
+    /// for, so crediting it to `5m` would undercharge a possible `1h` write while reporting
+    /// `exact`. The residual is priced at the tier fallback and the request says `rate-fallback`.
+    #[test]
+    fn test_bedrock_buffered_aggregate_without_details_is_an_unmatched_residual() {
+        let (usage, finalized) = finalize(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cache_write_input_tokens: Some(1_500),
+            ..Default::default()
+        });
+
+        assert_eq!(usage.cache_creation_input_tokens, Some(1_500));
+        assert!(
+            usage.cache_write.class_totals().is_empty(),
+            "no class was observed, so none may be credited"
+        );
+        assert_eq!(usage.cache_write.unmatched_residual_tokens(), 1_500);
+        assert_eq!(usage.cache_write.fallback_tokens(), 1_500);
+        assert_eq!(finalized.cost.status, CostStatus::RateFallback);
+    }
+
+    /// A zero aggregate is a provider saying it wrote nothing, which is an exact statement.
+    ///
+    /// Only a *positive* fallback quantity degrades status, so this case must stay `Exact` — the
+    /// discriminator that keeps the test above about the residual rather than about the field
+    /// merely being present.
+    #[test]
+    fn test_bedrock_buffered_zero_aggregate_stays_exact() {
+        let (usage, finalized) = finalize(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cache_write_input_tokens: Some(0),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            usage.cache_creation_input_tokens,
+            Some(0),
+            "a reported zero is a statement, not silence"
+        );
+        assert_eq!(usage.cache_write.fallback_tokens(), 0);
+        assert_eq!(finalized.cost.status, CostStatus::Exact);
+    }
+
+    /// Details falling short of the aggregate leave the shortfall as a residual — priced at the
+    /// fallback rate, and specifically not topped up into the class that was reported.
+    #[test]
+    fn test_bedrock_buffered_partial_details_leave_a_residual() {
+        let (usage, finalized) = finalize(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cache_write_input_tokens: Some(1_500),
+            cache_details: Some(vec![detail("5m", 1_000)]),
+            ..Default::default()
+        });
+
+        assert_eq!(usage.cache_creation_input_tokens, Some(1_500));
+        assert_eq!(
+            class_tokens(&usage, "5m"),
+            1_000,
+            "the residual must not be absorbed into the observed class"
+        );
+        assert_eq!(usage.cache_write.unmatched_residual_tokens(), 500);
+        assert_eq!(usage.cache_write.fallback_tokens(), 500);
+        assert_eq!(finalized.cost.status, CostStatus::RateFallback);
+    }
+
+    /// A `ttl` that is not a duration at all is one unknown class, never guessed at, and its raw
+    /// spelling survives into the evidence.
+    ///
+    /// The fixture has to name something the shared grammar genuinely rejects. A value like
+    /// `"10m"` would not do: it canonicalizes fine and is merely a class the Bedrock tier does
+    /// not configure, which is the tier-fallback path rather than this one. `canonical_class` is
+    /// the assertion that separates them — `None` here, `Some` there.
+    #[test]
+    fn test_bedrock_buffered_uncanonicalizable_ttl_is_one_unknown_class() {
+        let (usage, finalized) = finalize(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cache_write_input_tokens: Some(1_000),
+            cache_details: Some(vec![detail("forever", 1_000)]),
+            ..Default::default()
+        });
+
+        assert!(usage.cache_write.class_totals().is_empty());
+        assert_eq!(usage.cache_write.unknown_tokens(), 1_000);
+        assert_eq!(usage.cache_write.fallback_tokens(), 1_000);
+        assert_eq!(finalized.cost.status, CostStatus::RateFallback);
+
+        // Priced at the tier fallback — `max(configured, 1.0)` = 2.0x over a 3,000 input rate.
+        assert_eq!(finalized.cost.cache_write_cost.0, 1_000 * 6_000);
+
+        let evidence: Vec<(String, Option<String>)> = usage
+            .cache_write
+            .evidence_entries()
+            .iter()
+            .map(|e| {
+                (
+                    e.raw_key.clone(),
+                    e.canonical_class.map(|c| c.as_str().to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            evidence,
+            vec![("forever".to_string(), None)],
+            "the raw spelling is retained and no class is invented for it"
+        );
+    }
+
+    /// Contradictory views reconcile to the larger quantity and say so, rather than trusting
+    /// whichever view happens to be smaller.
+    #[test]
+    fn test_bedrock_buffered_details_exceeding_aggregate_reconcile_upward() {
+        let (usage, finalized) = finalize(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cache_write_input_tokens: Some(1_000),
+            cache_details: Some(vec![detail("5m", 2_000)]),
+            ..Default::default()
+        });
+
+        assert_eq!(usage.cache_creation_input_tokens, Some(2_000));
+        assert_eq!(class_tokens(&usage, "5m"), 2_000);
+        assert_eq!(usage.cache_write.fallback_tokens(), 0);
+        assert_eq!(finalized.cost.status, CostStatus::Reconciled);
+    }
+
+    /// The exact-cost oracle: mixed `5m`/`1h` writes plus reads, hand-computed against the
+    /// bundled Bedrock entry.
+    ///
+    /// Rates in nano-USD per token — input 3,000; output 15,000; cache read `3,000 x 0.1` = 300;
+    /// `5m` write `3,000 x 1.25` = 3,750; `1h` write `3,000 x 2.0` = 6,000.
+    ///
+    /// | Component  | Tokens | Rate   | Cost       |
+    /// |------------|--------|--------|------------|
+    /// | input      | 10,000 |  3,000 | 30,000,000 |
+    /// | cache read |  2,000 |    300 |    600,000 |
+    /// | `5m` write |  1,000 |  3,750 |  3,750,000 |
+    /// | `1h` write |    500 |  6,000 |  3,000,000 |
+    /// | output     |    500 | 15,000 |  7,500,000 |
+    /// | **total**  |        |        | 44,850,000 |
+    ///
+    /// The contract is `Additive`, so `inputTokens` already excludes both cache buckets and no
+    /// carve-out applies: the accumulator's charge is the whole cache charge.
+    #[test]
+    fn test_bedrock_buffered_mixed_class_cost_oracle() {
+        let (_, finalized) = finalize(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cache_read_input_tokens: Some(2_000),
+            cache_write_input_tokens: Some(1_500),
+            cache_details: Some(vec![detail("5m", 1_000), detail("1h", 500)]),
+        });
+
+        assert_eq!(finalized.cost.input_cost.0, 30_000_000);
+        assert_eq!(finalized.cost.cached_input_cost.0, 600_000);
+        assert_eq!(finalized.cost.cache_write_cost.0, 6_750_000);
+        assert_eq!(finalized.cost.output_cost.0, 7_500_000);
+        assert_eq!(finalized.cost.total_cost.0, 44_850_000);
+        assert_eq!(finalized.cost.status, CostStatus::Exact);
+    }
+
+    /// A response with no cache fields bills exactly as it did before the fields were parsed:
+    /// nothing is published, nothing is accounted, and the cost is input plus output alone.
+    #[test]
+    fn test_bedrock_buffered_no_cache_fields_bills_as_before() {
+        let (usage, finalized) = finalize(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            usage.cache_creation_input_tokens, None,
+            "silence must not be published as a zero"
+        );
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_write.accounted_tokens(), 0);
+        assert_eq!(finalized.cost.total_cost.0, 30_000_000 + 7_500_000);
+        assert_eq!(finalized.cost.status, CostStatus::Exact);
+    }
+
+    /// `total_tokens` stays `inputTokens + outputTokens` and does not absorb the cache buckets.
+    ///
+    /// Understated once the buckets are parsed, and deliberately so: the sibling Additive lane
+    /// publishes the same convention, and changing it is a cross-provider wire change rather than
+    /// something to fix on one lane in passing.
+    #[test]
+    fn test_bedrock_total_tokens_excludes_the_cache_buckets() {
+        let (usage, _) = finalize(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cache_read_input_tokens: Some(2_000),
+            cache_write_input_tokens: Some(1_500),
+            cache_details: Some(vec![detail("5m", 1_500)]),
+        });
+
+        assert_eq!(usage.total_tokens, 10_500);
+    }
+
+    /// The surfaces that carry a cache-write quantity agree, and so do the ones that carry cost.
+    ///
+    /// Covers three of the four surfaces the criterion names: the response body, the emitted
+    /// `X-Oxigate-Request-Cost` / `X-Oxigate-Cost-Status` headers, and the persisted row. The
+    /// spend row has no cache-write column by design, so the quantity pair is the response field
+    /// and the persisted evidence; cache *reads* are a column and are checked against it.
+    ///
+    /// **Two legs are not covered here and are not claimed:** the terminal `oxigate.usage` event
+    /// and the Redis budget increment are emitted by the request handler, not by anything this
+    /// test can reach, so proving a Bedrock cache cost reaches them needs handler-level coverage.
+    /// The generic budget tests exercise that path but not this lane's newly parsed quantity.
+    #[test]
+    fn test_bedrock_cache_surfaces_agree() {
+        use crate::domain::auth::RequestIdentity;
+        use crate::domain::spend::SpendRecord;
+        use crate::utils::cost_headers::CostHeader;
+
+        let (usage, headers, finalized) = finalize_with_headers(ConverseUsage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cache_read_input_tokens: Some(2_000),
+            cache_write_input_tokens: Some(1_500),
+            cache_details: Some(vec![detail("5m", 1_000), detail("1h", 500)]),
+        });
+        let record = SpendRecord::build(
+            &RequestIdentity::default(),
+            PRICED_MODEL,
+            "bedrock",
+            &finalized,
+            7,
+        );
+
+        // Quantity: the response field and the persisted evidence are the only two surfaces that
+        // carry a cache-write quantity at all.
+        let evidence = record
+            .usage_evidence
+            .as_ref()
+            .expect("an accounted cache write persists its evidence");
+        assert_eq!(
+            usage.cache_creation_input_tokens,
+            Some(evidence.cache_write.accounted_tokens)
+        );
+        // Cache reads are a column.
+        assert_eq!(
+            record.cache_read_tokens as u64,
+            usage.cache_read_input_tokens.unwrap_or(0)
+        );
+        // Cost and status: the emitted headers, the finalization and the row carry the same two
+        // values. Asserted against the absolute oracle, not just against each other, so three
+        // equal-but-wrong surfaces cannot satisfy it.
+        assert_eq!(record.cost_nano_usd, finalized.cost.total_cost);
+        assert_eq!(record.cost_status, finalized.cost.status);
+        assert_eq!(record.cost_nano_usd.0, 44_850_000);
+        assert_eq!(
+            headers
+                .get(CostHeader::REQUEST_COST)
+                .and_then(|v| v.to_str().ok()),
+            Some(finalized.cost.total_cost.to_display_string()).as_deref()
+        );
+        assert_eq!(
+            headers
+                .get(CostHeader::COST_STATUS)
+                .and_then(|v| v.to_str().ok()),
+            Some("exact")
+        );
+    }
 
     fn make_request(messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
@@ -650,12 +1219,14 @@ mod tests {
             usage: Some(ConverseUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             }),
         };
         let chat = converse_response_to_chat(
             &converse_resp,
             "anthropic.claude-3-5-sonnet-20241022-v2:0",
             "req-001",
+            &test_pricing_context(),
         );
         assert_eq!(chat.choices.len(), 1);
         let msg = &chat.choices[0].message;
@@ -689,12 +1260,14 @@ mod tests {
             usage: Some(ConverseUsage {
                 input_tokens: 5,
                 output_tokens: 3,
+                ..Default::default()
             }),
         };
         let chat = converse_response_to_chat(
             &converse_resp,
             "anthropic.claude-3-5-sonnet-20241022-v2:0",
             "req-002",
+            &test_pricing_context(),
         );
         assert_eq!(chat.choices.len(), 1);
         if let Some(MessageContent::Text(t)) = &chat.choices[0].message.content {
@@ -727,9 +1300,11 @@ mod tests {
             usage: Some(ConverseUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             }),
         };
-        let chat = converse_response_to_chat(&converse_resp, "model", "id");
+        let chat =
+            converse_response_to_chat(&converse_resp, "model", "id", &test_pricing_context());
         assert_eq!(chat.usage.prompt_tokens, 100);
         assert_eq!(chat.usage.completion_tokens, 50);
         assert_eq!(chat.usage.total_tokens, 150);

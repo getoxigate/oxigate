@@ -117,7 +117,7 @@ pub fn router_with_metrics(
 /// Intended for integration tests that need to verify the 413 enforcement path
 /// with a small limit without sending 50 MiB of data.
 pub fn router_with_body_limit(state: AppState, max_request_body_bytes: usize) -> Router {
-    // Step 1 — routes only (both tiers).
+    // Step 1 — routes only.
     let v1_routes = Router::new()
         .route("/chat/completions", post(chat::chat_completions))
         .route("/embeddings", post(embeddings::embeddings))
@@ -161,7 +161,7 @@ pub fn router_with_body_limit(state: AppState, max_request_body_bytes: usize) ->
                 Arc::clone(&state.budget_settings),
             ));
 
-    // Step 4 — auth + global safety + request metrics (both tiers).
+    // Step 4 — auth + global safety + request metrics.
     // Layer declaration order (innermost → outermost):
     //   TaggerLayer             (innermost of this block)
     //   AuthLayer
@@ -170,7 +170,7 @@ pub fn router_with_body_limit(state: AppState, max_request_body_bytes: usize) ->
     //   RequestMetricsLayer     (outermost: measures full e2e latency incl. auth + body limit)
     //   ActiveConnectionsLayer  (outermost: counts connections for the full v1 scope)
     //
-    //: DefaultBodyLimit rejects oversized bodies with 413 before other middleware.
+    // Note: DefaultBodyLimit rejects oversized bodies with 413 before other middleware.
     let v1_routes = v1_routes
         .layer(TaggerLayer::new())
         .layer(AuthLayer::new(Arc::clone(&state.auth)))
@@ -238,7 +238,10 @@ pub(crate) fn inject_attempted_headers(
 
 /// Emit a structured cost log line and spawn a fire-and-forget spend write.
 ///
-/// Called from both the chat and embeddings handlers after usage data is available.
+/// Called from both the chat and embeddings handlers once the request's accounting is finalized —
+/// which is not the same as once usage is available. A cleanly-ended stream whose provider
+/// reported no usage is finalized as `cost-unavailable` and logged and written here like any
+/// other, with zero quantities and zero cost, so the request leaves a trace rather than vanishing.
 /// `event_name` becomes the tracing message (e.g. `"chat_completion_cost"`, `"embedding_cost"`).
 /// `request_body_bytes` is intentionally omitted — that debug field stays local to the chat handler.
 pub(crate) fn spawn_cost_log_and_spend(

@@ -10,8 +10,8 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::domain::chat::{
-    ChatRequest, ChatResponse, Choice, Message, MessageContent, Role, StreamChunk, ToolCall,
-    ToolCallFunction, Usage,
+    CacheAccounting, ChatRequest, ChatResponse, Choice, Message, MessageContent,
+    ReasoningAccounting, Role, StreamChunk, ToolCall, ToolCallFunction, Usage, UsageAccounting,
 };
 use crate::domain::embedding::{EmbeddingData, EmbeddingResponse, EmbeddingUsage};
 use crate::providers::gemini::types::EmbedContentItem;
@@ -28,6 +28,22 @@ use super::types::{
 use super::{ModelFlags, model_flags};
 use crate::domain::chat::CompletionTokensDetails;
 use crate::utils::sse;
+
+/// Token accounting declared by the Google Gemini `generateContent` contract.
+///
+/// Cache is **inclusive**: `ai.google.dev/api/generate-content` documents `promptTokenCount` as
+/// "the total effective prompt size meaning this includes the number of tokens in the cached
+/// content" (accessed 2026-08-10), so the cached portion is subtracted from the reported prompt
+/// before the remainder is charged at the full input rate.
+///
+/// Reasoning is **additive** and stays that way: the same page documents `totalTokenCount` as
+/// "prompt + thoughts + response candidates", so `thoughtsTokenCount` sits outside
+/// `candidatesTokenCount` — the opposite of OpenAI and Anthropic. Carving thoughts out of the
+/// completion total here would turn a correct charge into an undercharge.
+const GEMINI_ACCOUNTING: UsageAccounting = UsageAccounting {
+    cache: CacheAccounting::Inclusive,
+    reasoning: ReasoningAccounting::Additive,
+};
 
 /// Translation error.
 #[derive(Debug, Error)]
@@ -489,19 +505,8 @@ pub fn gemini_to_openai(
         .as_ref()
         .map(usage_metadata_to_usage)
         .unwrap_or(Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            completion_tokens_details: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-            prompt_tokens_details: None,
-            tier_threshold_override: None,
-            cache_accounting: crate::domain::chat::CacheAccounting::Additive,
-            image_units: None,
-            audio_seconds: None,
-            cache_creation_5m_tokens: 0,
-            cache_creation_1h_tokens: 0,
+            accounting: GEMINI_ACCOUNTING,
+            ..Default::default()
         });
 
     let id = format!("chatcmpl-{request_id}");
@@ -548,9 +553,6 @@ fn usage_metadata_to_usage(u: &UsageMetadata) -> Usage {
     let completion_tokens_details = u.thoughts_token_count.map(|t| CompletionTokensDetails {
         reasoning_tokens: Some(t.into()),
     });
-    // Align Vertex with AI Studio for tier selection.
-    // Per-category tier lookup (separate tier per token type) is deferred.
-    let tier_threshold_override = Some(prompt + cached);
     Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
@@ -559,12 +561,10 @@ fn usage_metadata_to_usage(u: &UsageMetadata) -> Usage {
         cache_creation_input_tokens: None,
         cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
         prompt_tokens_details: None,
-        tier_threshold_override,
-        cache_accounting: crate::domain::chat::CacheAccounting::Additive,
+        accounting: GEMINI_ACCOUNTING,
         image_units: None,
         audio_seconds: None,
-        cache_creation_5m_tokens: 0,
-        cache_creation_1h_tokens: 0,
+        ..Default::default()
     }
 }
 
@@ -720,6 +720,17 @@ mod tests {
     use crate::domain::chat::MessageContent;
     use crate::domain::ports::TokenUsage;
     use crate::providers::gemini::types::Candidate;
+    use crate::utils::cost_headers::build_cost_headers;
+
+    fn pricing_holder() -> std::sync::Arc<std::sync::RwLock<crate::domain::pricing::PricingDb>> {
+        std::sync::Arc::new(std::sync::RwLock::new(
+            crate::domain::pricing::PricingDb::load(
+                crate::domain::pricing::BUNDLED_PRICING_JSON,
+                &crate::config::PricingConfig::default(),
+            )
+            .expect("bundled pricing must load"),
+        ))
+    }
 
     #[test]
     fn test_openai_tool_call_message_translated_to_function_call_part() {
@@ -1039,41 +1050,122 @@ mod tests {
         assert!(openai.usage.completion_tokens_details.is_none());
     }
 
-    /// Vertex uses input+cached for tier selection (same as AI Studio).
+    /// `promptTokenCount` already contains the cached tokens, so treating cache reads as additive
+    /// billed them at the full input rate inside the prompt *and* again at the cache rate — and
+    /// counted them twice for tier selection, pushing the request into a higher-priced tier.
+    ///
+    /// `gemini-2.5-pro`, promptTokenCount 150,000 containing 100,000 cached, candidates 1,000.
+    /// Previously 640_000_000 nano-USD at tier 1, then 197_500_000 at tier 0 once the double
+    /// charge was fixed, and now 85_000_000 with the entry's imported `cache_read_multiplier`
+    /// (0.1x) applied on top — every component is asserted, not only the total, so a
+    /// compensating pair of errors cannot pass.
     #[test]
-    fn test_vertex_tier_threshold_uses_input_plus_cached() {
-        let resp = GeminiChatResponse {
-            candidates: vec![Candidate {
-                content: Some(Content {
-                    role: Some("model".into()),
-                    parts: vec![Part::Text {
-                        text: "ok".to_string(),
-                    }],
-                }),
-                finish_reason: Some("STOP".into()),
-                index: Some(0),
-            }],
-            usage_metadata: Some(UsageMetadata {
-                prompt_token_count: Some(50_000),
-                candidates_token_count: Some(100),
-                total_token_count: None,
-                cached_content_token_count: Some(200_000),
-                thoughts_token_count: None,
-            }),
-            model_version: None,
-            prompt_feedback: None,
+    fn test_cache_double_charge_regression() {
+        let usage = Usage {
+            prompt_tokens: 150_000,
+            completion_tokens: 1_000,
+            total_tokens: 151_000,
+            cache_read_input_tokens: Some(100_000),
+            accounting: GEMINI_ACCOUNTING,
+            ..Default::default()
         };
-        let openai = gemini_to_openai(&resp, "gemini-2.5-pro", "req-1").expect("must translate");
+
+        let (_, finalized) = build_cost_headers("gemini-2.5-pro", &usage, pricing_holder(), false);
+        let (cost, token_usage) = (&finalized.cost, &finalized.token_usage);
+
         assert_eq!(
-            openai.usage.tier_threshold_override,
-            Some(250_000),
-            "Vertex must use prompt+cached for tier selection"
+            token_usage.input_tokens, 50_000,
+            "the cached portion is carved out of the reported prompt"
+        );
+        assert_eq!(
+            token_usage.context_input_tokens(),
+            150_000,
+            "tier selection reads the reported prompt once, not prompt plus cached"
+        );
+        assert_eq!(cost.input_cost, crate::domain::ports::NanoUsd(62_500_000));
+        assert_eq!(
+            cost.cached_input_cost,
+            crate::domain::ports::NanoUsd(12_500_000)
+        );
+        assert_eq!(cost.output_cost, crate::domain::ports::NanoUsd(10_000_000));
+        assert_eq!(cost.total_cost, crate::domain::ports::NanoUsd(85_000_000));
+    }
+
+    /// Gemini's reasoning axis stays `Additive`, and that is a correction in its own right.
+    ///
+    /// `totalTokenCount` is documented as "prompt + thoughts + response candidates", so
+    /// `thoughtsTokenCount` sits **outside** `candidatesTokenCount` — the opposite of OpenAI and
+    /// Anthropic. Carving thoughts out of the completion total here would turn a correct charge
+    /// into an undercharge.
+    ///
+    /// This is the guard against "finishing the job" by flipping Gemini alongside the others.
+    #[test]
+    fn test_reasoning_stays_additive_because_thoughts_sit_outside_candidates() {
+        assert_eq!(GEMINI_ACCOUNTING.reasoning, ReasoningAccounting::Additive);
+
+        let usage = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 1_000,
+            total_tokens: 1_800,
+            completion_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: Some(800),
+            }),
+            accounting: GEMINI_ACCOUNTING,
+            ..Default::default()
+        };
+
+        let (_, finalized) = build_cost_headers("gemini-2.5-pro", &usage, pricing_holder(), false);
+        let token_usage = &finalized.token_usage;
+
+        assert_eq!(
+            token_usage.standard_output_tokens(),
+            1_000,
+            "candidatesTokenCount is charged whole; thoughts are charged beside it"
         );
     }
 
-    /// AI Studio tier threshold unchanged (regression guard).
+    /// Both `Usage` construction paths — populated `usageMetadata` and the absent-metadata
+    /// fallback — apply the same accounting declaration, so the zero-usage case is not billed
+    /// under the type default while the populated case is billed under Gemini's contract.
     #[test]
-    fn test_ai_studio_tier_threshold_unchanged() {
+    fn test_both_usage_paths_apply_the_same_accounting() {
+        let populated = usage_metadata_to_usage(&UsageMetadata {
+            prompt_token_count: Some(10),
+            candidates_token_count: Some(5),
+            total_token_count: Some(15),
+            cached_content_token_count: None,
+            thoughts_token_count: None,
+        });
+
+        let resp = GeminiChatResponse {
+            candidates: vec![Candidate {
+                content: Some(Content {
+                    role: Some("model".into()),
+                    parts: vec![Part::Text {
+                        text: "ok".to_string(),
+                    }],
+                }),
+                finish_reason: Some("STOP".into()),
+                index: Some(0),
+            }],
+            usage_metadata: None,
+            model_version: None,
+            prompt_feedback: None,
+        };
+        let absent = gemini_to_openai(&resp, "gemini-2.5-pro", "req-1").expect("must translate");
+
+        assert_eq!(populated.accounting, GEMINI_ACCOUNTING);
+        assert_eq!(absent.usage.accounting, GEMINI_ACCOUNTING);
+    }
+
+    /// Tier selection reads the total prompt context of a cached Gemini request.
+    ///
+    /// The payload is one Gemini can actually emit: `promptTokenCount` is documented as the total
+    /// effective prompt size *including* the cached content, so a 250,000-token prompt containing
+    /// 200,000 cached tokens is the shape to test. The earlier fixture asserted a 50,000 prompt
+    /// alongside 200,000 cached tokens, which this contract cannot produce.
+    #[test]
+    fn test_cached_prompt_tier_comparator() {
         let resp = GeminiChatResponse {
             candidates: vec![Candidate {
                 content: Some(Content {
@@ -1086,7 +1178,7 @@ mod tests {
                 index: Some(0),
             }],
             usage_metadata: Some(UsageMetadata {
-                prompt_token_count: Some(50_000),
+                prompt_token_count: Some(250_000),
                 candidates_token_count: Some(100),
                 total_token_count: None,
                 cached_content_token_count: Some(200_000),
@@ -1096,10 +1188,55 @@ mod tests {
             prompt_feedback: None,
         };
         let openai = gemini_to_openai(&resp, "gemini-2.5-pro", "req-1").expect("must translate");
+        let (_, finalized) =
+            build_cost_headers("gemini-2.5-pro", &openai.usage, pricing_holder(), false);
+        let token_usage = &finalized.token_usage;
+
+        // The cached tokens are already inside `promptTokenCount`, so the comparator is the
+        // reported prompt itself — counting them again selected a higher-priced tier.
+        assert_eq!(token_usage.context_input_tokens(), 250_000);
+    }
+
+    /// The billable plain input of the same cached Gemini request.
+    ///
+    /// Paired with the comparator test above on an identical payload: the two dimensions move
+    /// independently under a change of cache declaration, so each is asserted on its own.
+    #[test]
+    fn test_cached_prompt_billable_input() {
+        let resp = GeminiChatResponse {
+            candidates: vec![Candidate {
+                content: Some(Content {
+                    role: Some("model".into()),
+                    parts: vec![Part::Text {
+                        text: "ok".to_string(),
+                    }],
+                }),
+                finish_reason: Some("STOP".into()),
+                index: Some(0),
+            }],
+            usage_metadata: Some(UsageMetadata {
+                prompt_token_count: Some(250_000),
+                candidates_token_count: Some(100),
+                total_token_count: None,
+                cached_content_token_count: Some(200_000),
+                thoughts_token_count: None,
+            }),
+            model_version: None,
+            prompt_feedback: None,
+        };
+        let openai = gemini_to_openai(&resp, "gemini-2.5-pro", "req-1").expect("must translate");
+        let (_, finalized) =
+            build_cost_headers("gemini-2.5-pro", &openai.usage, pricing_holder(), false);
+        let token_usage = &finalized.token_usage;
+
+        // The cached portion is carved out of the reported prompt, so it is charged once at the
+        // cache rate instead of at the full input rate as well.
+        assert_eq!(token_usage.input_tokens, 50_000);
+        assert_eq!(token_usage.cache_read_input_tokens, 200_000);
         assert_eq!(
-            openai.usage.tier_threshold_override,
-            Some(250_000),
-            "AI Studio must use prompt+cached for tier selection"
+            token_usage.input_tokens + token_usage.cache_read_input_tokens,
+            250_000,
+            "the two buckets partition the reported prompt; neither token is in both"
         );
     }
 

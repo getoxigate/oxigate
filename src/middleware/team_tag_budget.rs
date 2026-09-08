@@ -2,8 +2,6 @@
 // Copyright (C) 2026 OxiGate contributors
 //! Per-team and per-tag budget enforcement middleware .
 //!
-//! Community tier — no feature gate.
-//!
 //! `TeamTagBudgetLayer` runs pre-dispatch:
 //!   - Builds a check_list from the request's team tag + all matching tag kv entries in config.
 //!   - Redis GET pipeline fetches current spend for all matched keys (single round trip).

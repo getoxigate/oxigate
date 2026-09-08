@@ -219,14 +219,73 @@ providers:
 
 ---
 
+## Token accounting — read this before trusting a cost figure
+
+Every `openai_compat` instance is billed under one generic declaration, regardless of which backend
+it points at:
+
+| Axis | Assumed semantics |
+|---|---|
+| Cache | `prompt_tokens` **contains** `prompt_tokens_details.cached_tokens` |
+| Reasoning | reasoning tokens are charged **beside** the reported completion total |
+
+**The reasoning assumption is known to be wrong for some backends, and is deliberately left in
+place.** Where a backend reports its reasoning count *inside* `completion_tokens` — as OpenAI and
+Anthropic both do — that subset is charged twice: once inside the completion total at the output
+rate, and once again at the reasoning rate. Cost is overstated on reasoning-heavy requests to those
+backends.
+
+This is not an oversight. Speaking the OpenAI wire format proves what fields a backend emits, not
+how it counts them, and a third-party backend's counting is not covered by any first-party
+reference. Adopting OpenAI's declaration for every compat instance would be an unverified billing
+change applied to backends nobody has measured — trading a known overstatement for an unknown one.
+
+The declaration will be made per backend as captured payloads establish what each actually reports.
+Native OpenAI and Azure deployments already have theirs and are **not** affected by this — see
+`providers/openai.md` and `providers/azure.md`. If you are routing OpenAI or Azure traffic through
+`openai_compat` rather than through their own adapters, you are opting into this overstatement.
+
+The cache assumption is the safer of the two: a backend that reports its cache buckets disjointly
+would have those tokens subtracted from a prompt total that never contained them, which understates
+cost. No configured backend below is known to do this.
+
+### Cache writes are echoed, not priced
+
+If a backend reports `prompt_tokens_details.cache_write_tokens`, that field is passed through to
+your client verbatim — it is an OpenAI-standard field your backend chose to send. **Nothing is
+billed from it.** No cache-write quantity is accounted, cost and cost status are unaffected, and
+nothing is carved out of the prompt total for it.
+
+The gateway does not derive `cache_creation_input_tokens` from `cache_write_tokens` on this adapter.
+If your backend sends `cache_creation_input_tokens` of its own, that value passes through
+untouched — but it is the backend's number, not a quantity OxiGate accounted or billed, and no
+gateway cost figure is derived from it.
+
+Same reason as above: the wire format proves the field exists, not what the backend charges for it
+or which cache duration it belongs to. Native OpenAI and Azure deployments do price it — see
+`providers/openai.md` and `providers/azure.md` — because their vendors document a single supported
+duration and a rate for it. No such reference covers "any backend that accepts this schema".
+
+The written tokens are not lost — they stay inside `prompt_tokens` and are charged at the plain
+input rate like any other prompt token. What is missing is the cache-write premium: if your backend
+bills writes above its input rate, gateway cost figures understate that difference, and so does the
+budget counter.
+
+### What is not affected
+
+`X-Oxigate-Input-Tokens` and `X-Oxigate-Output-Tokens` report the backend's own figures verbatim on
+every instance. Only what is charged at each rate is subject to the assumptions above.
+
+---
+
 ## Feature / behaviour table
 
 | Feature | Behaviour |
 |---|---|
 | **Parsing** | Partial — only `model` and `max_tokens` are inspected for routing and budget pre-flight. The full request body is re-serialized from the deserialized `ChatRequest` and forwarded verbatim. |
 | **Streaming** | Supported. Raw bytes forwarded; carry-buffer state machine reassembles SSE lines split across chunk boundaries. |
-| **Cost signal timing** | End-of-stream — `usage` is scanned on every forwarded chunk; the last received value is authoritative. If absent, cost is zero for that request and a `WARN` is emitted. |
-| **Cache token breakdown** | Not available — no provider in this category exposes Anthropic-style cache fields. `cache_read_input_tokens` and `cache_creation_input_tokens` will always be zero. |
+| **Cost signal timing** | End-of-stream — `usage` is scanned on every forwarded chunk; the last received value is authoritative. If absent, the request is finalized as **cost-unavailable**: a terminal `oxigate.usage` event and a spend row are still written, both carrying zeros, and one `request accounting anomaly` `WARN` reports `provider-usage-missing`. Those zeros mean the cost is *unknown*, not that the request was free. `stream_options_support: false` (the default) disables **injection**, not parsing — the adapter still scans every chunk, so a backend that sends `usage` unprompted is costed normally. It is a backend that sends none, un-asked, that hits this on every streamed request. |
+| **Cache token breakdown** | Read only. `prompt_tokens_details.cached_tokens` is normalized to `cache_read_input_tokens` and priced at the tier's `cache_read_multiplier`. `cache_write_tokens` is echoed but never accounted, and `cache_creation_input_tokens` is never derived from it — see [Cache writes are echoed, not priced](#cache-writes-are-echoed-not-priced). The adapter does not parse a per-duration cache-write breakdown. |
 | **Budget enforcement posture** | Pre-flight enforcement only (spend-based `HardCapLayer`). `max_tokens`-based projection will be added later. Mid-stream termination is not possible because usage arrives at or after stream end. |
 | **Tool use** | Opt-in per instance via `supports_tools: true` (default: `false`). Set this for providers that implement the OpenAI tools spec. Affects the `/v1/models` response and future capability-aware routing filters. See [Response parsing and error handling](#response-parsing-and-error-handling) for how choice parse failures are handled. |
 

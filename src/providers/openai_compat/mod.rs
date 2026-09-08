@@ -26,7 +26,9 @@ use crate::domain::ports::{
     ChatCompletionStream, HealthStatus, ProviderAdapter, ProviderAdapterExt, ProviderError,
     ProviderKind, ProviderMetadata,
 };
-use crate::providers::openai::utils::{inject_stream_options, normalize_openai_usage};
+use crate::providers::openai::utils::{
+    COMPAT_DEFAULT_ACCOUNTING, inject_stream_options, normalize_openai_usage,
+};
 use crate::utils::provider_error::{classify_reqwest_error, sanitize_network_error};
 
 const DEFAULT_COMPAT_TIMEOUT_SECS: u64 = 120;
@@ -147,7 +149,7 @@ fn parse_compat_response(
             Usage::default()
         }
     };
-    normalize_openai_usage(&mut usage);
+    normalize_openai_usage(&mut usage, COMPAT_DEFAULT_ACCOUNTING, None);
 
     let model = compat.model.unwrap_or_else(|| req_model.to_string());
     let choices = compat
@@ -232,7 +234,14 @@ impl ProviderAdapter for OpenAICompatAdapter {
             .await);
         }
 
-        Ok(make_compat_sse_stream(resp, self.config.name.clone()))
+        // No pricing context: a generic backend's cache-write semantics are unverified, so the
+        // field is echoed and nothing is accounted from it.
+        Ok(make_compat_sse_stream(
+            resp,
+            self.config.name.clone(),
+            COMPAT_DEFAULT_ACCOUNTING,
+            None,
+        ))
     }
 
     /// Zero-copy non-streaming forwarding: raw inbound bytes flow directly to upstream.
@@ -306,7 +315,12 @@ impl ProviderAdapter for OpenAICompatAdapter {
             ));
         }
 
-        Some(Ok(make_compat_sse_stream(resp, self.config.name.clone())))
+        Some(Ok(make_compat_sse_stream(
+            resp,
+            self.config.name.clone(),
+            COMPAT_DEFAULT_ACCOUNTING,
+            None,
+        )))
     }
 
     fn metadata(&self) -> &ProviderMetadata {
@@ -331,6 +345,7 @@ mod tests {
     use crate::domain::ports::ProviderError;
     use futures::StreamExt;
     use proptest::prelude::*;
+    use tracing_test::traced_test;
 
     fn make_config(name: &str, stream_options: bool) -> OpenAICompatConfig {
         OpenAICompatConfig {
@@ -366,6 +381,110 @@ mod tests {
             request_id: None,
             extra: Default::default(),
         }
+    }
+
+    /// A compat backend's `cache_write_tokens` is echoed back to the client but never priced.
+    ///
+    /// The two halves are asserted separately because they are separate promises. Adding the
+    /// field to `PromptTokensDetails` makes it round-trip through the compat lane, which
+    /// deserializes the upstream payload and re-serializes it — faithful passthrough of an
+    /// OpenAI-standard field the client asked its own backend for. What must *not* move is the
+    /// money: a generic backend's cache-write semantics are unverified, so the compat lane
+    /// supplies no pricing generation and the quantity is not accounted, priced, persisted or
+    /// counted against a budget. The budget counter takes the finalized total cost and nothing
+    /// else, so asserting that total pins it.
+    #[test]
+    fn compat_echoes_cache_write_tokens_without_pricing_them() {
+        use crate::domain::ports::NanoUsd;
+        use crate::domain::pricing::{BUNDLED_PRICING_JSON, PricingDb};
+        use crate::domain::spend::SpendRecord;
+        use crate::utils::cost_headers::build_cost_headers;
+
+        let body = |details: &str| {
+            format!(
+                r#"{{"id":"c1","object":"chat.completion","created":1,"model":"gpt-5.6-terra",
+                     "choices":[],
+                     "usage":{{"prompt_tokens":10000,"completion_tokens":500,
+                               "total_tokens":10500,"prompt_tokens_details":{details}}}}}"#
+            )
+        };
+        let with_write = parse_compat_response(
+            body(r#"{"cached_tokens":2000,"cache_write_tokens":1000}"#).as_bytes(),
+            "gpt-5.6-terra",
+            "compat",
+        )
+        .expect("payload parses");
+        let without_write = parse_compat_response(
+            body(r#"{"cached_tokens":2000}"#).as_bytes(),
+            "gpt-5.6-terra",
+            "compat",
+        )
+        .expect("payload parses");
+
+        // Half one: the field reaches the client.
+        let echoed = serde_json::to_value(&with_write.usage).expect("usage serializes");
+        assert_eq!(
+            echoed["prompt_tokens_details"]["cache_write_tokens"],
+            serde_json::json!(1000),
+            "an OpenAI-standard field the backend reported is passed through"
+        );
+        assert!(
+            serde_json::to_value(&without_write.usage).expect("usage serializes")
+                ["prompt_tokens_details"]
+                .get("cache_write_tokens")
+                .is_none(),
+            "and is absent when the backend did not report it"
+        );
+
+        // Half two: nothing about the money moves.
+        assert_eq!(
+            with_write.usage.cache_creation_input_tokens, None,
+            "the compat lane accounts no cache-write quantity"
+        );
+        assert_eq!(with_write.usage.cache_write.observation_count(), 0);
+
+        let holder = Arc::new(std::sync::RwLock::new(
+            PricingDb::load(
+                BUNDLED_PRICING_JSON,
+                &crate::config::PricingConfig::default(),
+            )
+            .expect("bundled pricing must load"),
+        ));
+        let priced =
+            |usage| build_cost_headers("gpt-5.6-terra", usage, Arc::clone(&holder), false).1;
+        let (a, b) = (priced(&with_write.usage), priced(&without_write.usage));
+
+        // Pinned absolutely, not only against each other: two equal-but-wrong totals would
+        // satisfy a comparison. `gpt-5.6-terra` base tier, cache-inclusive prompt — 8,000 × 2,000
+        // input, 500 × 12,000 output, 2,000 × 200 cache read.
+        assert_eq!(a.cost.total_cost, NanoUsd(22_400_000));
+        assert_eq!(a.cost.total_cost, b.cost.total_cost);
+        assert_eq!(a.cost.cache_write_cost, NanoUsd::zero());
+        assert_eq!(a.cost.status, b.cost.status);
+        assert_eq!(
+            a.cost.status,
+            crate::domain::usage_accounting::CostStatus::Exact
+        );
+
+        let identity = crate::domain::auth::RequestIdentity {
+            id: "key-1".into(),
+            org_id: "acme".into(),
+            label: None,
+            tags: std::collections::HashMap::new(),
+        };
+        let row =
+            |accounting| SpendRecord::build(&identity, "gpt-5.6-terra", "compat", accounting, 1);
+        let (row_a, row_b) = (row(&a), row(&b));
+        assert_eq!(row_a.prompt_tokens, row_b.prompt_tokens);
+        assert_eq!(row_a.completion_tokens, row_b.completion_tokens);
+        assert_eq!(row_a.cache_read_tokens, row_b.cache_read_tokens);
+        assert_eq!(row_a.thinking_tokens, row_b.thinking_tokens);
+        assert_eq!(row_a.cost_nano_usd, row_b.cost_nano_usd);
+        assert_eq!(row_a.cost_status, row_b.cost_status);
+        assert!(
+            row_a.usage_evidence.is_none(),
+            "an unaccounted quantity leaves no evidence document behind"
+        );
     }
 
     #[tokio::test]
@@ -471,20 +590,24 @@ mod tests {
     #[test]
     fn extract_usage_from_complete_sse_line() {
         let line = r#"data: {"id":"x","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
-        let usage = extract_usage_from_sse_line(line).expect("must parse usage");
+        let usage = extract_usage_from_sse_line(line, COMPAT_DEFAULT_ACCOUNTING, None)
+            .expect("must parse usage");
+        assert_eq!(usage.accounting, COMPAT_DEFAULT_ACCOUNTING);
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
     }
 
     #[test]
     fn extract_usage_returns_none_for_done() {
-        assert!(extract_usage_from_sse_line("data: [DONE]").is_none());
+        assert!(
+            extract_usage_from_sse_line("data: [DONE]", COMPAT_DEFAULT_ACCOUNTING, None).is_none()
+        );
     }
 
     #[test]
     fn extract_usage_returns_none_when_usage_null() {
         let line = r#"data: {"id":"x","usage":null}"#;
-        assert!(extract_usage_from_sse_line(line).is_none());
+        assert!(extract_usage_from_sse_line(line, COMPAT_DEFAULT_ACCOUNTING, None).is_none());
     }
 
     #[test]
@@ -785,6 +908,36 @@ mod tests {
         }
     }
 
+    /// A compat stream that ends without upstream usage says nothing about it from the lane.
+    ///
+    /// The missing-usage fact belongs to the single warning a completed request emits at
+    /// finalization; a second WARN here would describe the same fact twice — and on a backend that
+    /// reports no usage unless asked, and is not asked because `stream_options` injection is off,
+    /// on every streamed request it ever serves. The flag governs injection, not parsing: a
+    /// backend that volunteers `usage` is read normally with injection disabled, so it is the
+    /// backend's behaviour and not the setting that makes this the every-request case.
+    #[traced_test]
+    #[tokio::test]
+    async fn compat_stream_without_usage_emits_no_lane_local_warning() {
+        let chunks = vec![
+            bytes::Bytes::from_static(
+                b"data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            ),
+            bytes::Bytes::from_static(b"data: [DONE]\n\n"),
+        ];
+
+        let yielded = drive_compat_adapter_with_chunks(chunks).await;
+
+        assert!(
+            yielded.iter().all(|c| c.usage.is_none()),
+            "the fixture must be a genuinely usage-less stream for this assertion to mean anything"
+        );
+        assert!(
+            !logs_contain("upstream returned no usage data"),
+            "the missing-usage fact is the finalizer's to report, not the lane's"
+        );
+    }
+
     // ── try_forward_raw / try_forward_raw_stream unit tests ─────────────────
 
     /// Spin up a local axum mock that records the exact bytes received and responds with
@@ -1012,6 +1165,272 @@ mod tests {
         assert!(
             Arc::ptr_eq(&a.http, &b.http),
             "both adapters must reference the same CompatHttpClient Arc"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache-write accounting at the adapter seam — the negative half
+    //
+    // A generic compat backend speaks the OpenAI wire format; that proves what fields it emits,
+    // not how it counts them. So `cache_write_tokens` is echoed and nothing is accounted from it.
+    // Asserted here, at the adapter, because a helper test cannot distinguish a lane that passes
+    // no pricing context from one that was simply never wired to a backend.
+    // -----------------------------------------------------------------------
+
+    use crate::providers::openai::utils::cache_write_fixture as fixture;
+
+    fn compat_config_for(mock_base: &str) -> OpenAICompatConfig {
+        let mut cfg = make_config("compat-cache-probe", false);
+        cfg.base_url = mock_base.to_string();
+        cfg
+    }
+
+    fn cache_write_request() -> ChatRequest {
+        let mut req = minimal_request();
+        req.model = fixture::MODEL.to_string();
+        req
+    }
+
+    /// A compat instance echoes the field and prices nothing from it.
+    ///
+    /// The response body *does* change relative to before the field existed on
+    /// `PromptTokensDetails` — that is faithful passthrough of an OpenAI-standard field the
+    /// client asked its own backend for. What must not change is the money: cost, status and the
+    /// quantities every downstream surface is derived from.
+    #[tokio::test]
+    async fn a_compat_instance_echoes_a_cache_write_without_accounting_it() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(crate::api::CHAT_COMPLETIONS_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": fixture::MODEL,
+                    "choices": [],
+                    "usage": fixture::usage_json(),
+                })),
+            )
+            .mount(&mock)
+            .await;
+
+        let adapter = OpenAICompatAdapter::new(compat_config_for(&mock.uri()), make_http())
+            .await
+            .expect("adapter must build");
+        let resp = adapter
+            .chat_completion(&cache_write_request())
+            .await
+            .expect("chat must succeed");
+
+        assert_eq!(
+            resp.usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cache_write_tokens),
+            Some(1_000),
+            "the upstream's own field is passed through to the client"
+        );
+        fixture::assert_unaccounted_and_unbilled(&resp.usage);
+    }
+
+    /// The same on the streamed path, which shares `make_compat_sse_stream` with Azure.
+    ///
+    /// Sharing that helper is exactly why this assertion is worth its cost: the helper now
+    /// carries a per-lane pricing context, and compat's is `None`.
+    #[tokio::test]
+    async fn a_compat_stream_echoes_a_cache_write_without_accounting_it() {
+        let mock = wiremock::MockServer::start().await;
+        let sse = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": fixture::MODEL,
+                "choices": [],
+                "usage": fixture::usage_json(),
+            })
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(crate::api::CHAT_COMPLETIONS_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse, "text/event-stream")
+                    .insert_header("Content-Type", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let adapter = OpenAICompatAdapter::new(compat_config_for(&mock.uri()), make_http())
+            .await
+            .expect("adapter must build");
+        let mut stream = adapter
+            .chat_completion_stream(&cache_write_request())
+            .await
+            .expect("stream must open");
+
+        let mut last_usage: Option<Usage> = None;
+        while let Some(chunk) = stream.next().await {
+            if let Some(u) = chunk.expect("no stream error").usage {
+                last_usage = Some(u);
+            }
+        }
+
+        fixture::assert_unaccounted_and_unbilled(
+            &last_usage.expect("the terminal chunk carries usage"),
+        );
+    }
+
+    // ── Terminal-chunk marking ────────────────────────────────────────────────────────
+    //
+    // The flag is derived from the carry buffer's line reassembly, never from the raw bytes of
+    // the chunk being yielded. A network read is not an SSE line: the terminator can arrive split
+    // across two reads or bundled behind a data frame, so a byte-suffix test on the yielded chunk
+    // is wrong in both directions. Nor is a line an event — the terminator is complete only once
+    // the blank line closing it has been read. These cases drive `make_compat_sse_stream` over a
+    // body whose read boundaries are fixed by the test rather than by the kernel, which is what
+    // makes the split case reproducible at all.
+
+    /// Feeds an exact sequence of network reads through the compat SSE stream.
+    ///
+    /// The response is assembled in-process from the given frames, so each element of `reads`
+    /// is delivered as one `bytes_stream` item. Driving the adapter over a socket would let the
+    /// transport coalesce the frames and silently turn the split case into the whole-line case.
+    async fn compat_chunks_for_reads(reads: &[&'static [u8]]) -> Vec<StreamChunk> {
+        let frames: Vec<Result<bytes::Bytes, std::io::Error>> = reads
+            .iter()
+            .map(|r| Ok(bytes::Bytes::from_static(r)))
+            .collect();
+        let body = reqwest::Body::wrap_stream(futures::stream::iter(frames));
+        let resp = reqwest::Response::from(axum::http::Response::new(body));
+
+        let mut stream = super::sse::make_compat_sse_stream(
+            resp,
+            "marking-test".to_string(),
+            COMPAT_DEFAULT_ACCOUNTING,
+            None,
+        );
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item.expect("no stream error"));
+        }
+        out
+    }
+
+    /// The one chunk whose read completed the terminator is terminal; nothing before it is.
+    fn assert_only_last_is_final(chunks: &[StreamChunk]) {
+        let marked: Vec<usize> = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_final)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![chunks.len() - 1],
+            "exactly the last chunk must be terminal, got marks at {marked:?} of {} chunks",
+            chunks.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn compat_marks_the_read_carrying_a_whole_done_line() {
+        let chunks = compat_chunks_for_reads(&[
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            b"data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert_eq!(chunks.len(), 2, "one chunk per read");
+        assert_only_last_is_final(&chunks);
+    }
+
+    /// A terminator split across two reads is only a terminator once the second read completes
+    /// the line. A suffix test on the yielded bytes would see `NE]\n\n` and miss it entirely.
+    #[tokio::test]
+    async fn compat_marks_the_read_that_completes_a_split_done_line() {
+        let chunks = compat_chunks_for_reads(&[
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DO",
+            b"NE]\n\n",
+        ])
+        .await;
+
+        assert_eq!(chunks.len(), 2, "one chunk per read");
+        assert_only_last_is_final(&chunks);
+    }
+
+    /// A terminator bundled behind a usage frame in one read marks that read, and the usage the
+    /// same read reported still rides on it — the marking must not displace the accounting.
+    #[tokio::test]
+    async fn compat_marks_a_bundled_done_read_and_keeps_its_usage() {
+        let chunks = compat_chunks_for_reads(&[
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            b"data: {\"id\":\"c2\",\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\ndata: [DONE]\n\n",
+        ])
+        .await;
+
+        assert_eq!(chunks.len(), 2, "one chunk per read");
+        assert_only_last_is_final(&chunks);
+        let usage = chunks[1]
+            .usage
+            .as_ref()
+            .expect("the bundled read reported usage");
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(usage.completion_tokens, 3);
+    }
+
+    /// The terminator event ends at the blank line after the marker, not at the marker's own
+    /// newline. When the separator lands in the next read, that read is the terminal one — and it
+    /// carries only the delimiter. Marking the earlier read would stop the stream with the event
+    /// still open, and the gateway's trailing event would merge into it.
+    #[tokio::test]
+    async fn compat_marks_the_read_that_closes_the_done_event() {
+        let chunks = compat_chunks_for_reads(&[b"data: [DONE]\n", b"\n"]).await;
+
+        assert_eq!(chunks.len(), 2, "one chunk per read");
+        assert_only_last_is_final(&chunks);
+    }
+
+    /// Only an empty line dispatches an event. A line of spaces is an unrecognized field line,
+    /// which the spec ignores and which leaves the terminator open — so the read carrying it is
+    /// not the terminal one, and the read carrying the real delimiter after it is.
+    #[tokio::test]
+    async fn compat_does_not_close_the_done_event_on_a_whitespace_line() {
+        let chunks = compat_chunks_for_reads(&[b"data: [DONE]\n", b" \n", b"\n"]).await;
+
+        assert_eq!(chunks.len(), 3, "one chunk per read");
+        assert_only_last_is_final(&chunks);
+    }
+
+    /// An event's payload is the concatenation of all its `data:` lines, so an event that merely
+    /// *ends* with the marker is not a bare terminator. Marking it would end the response with
+    /// the content of that same event still unaccounted for — the handler stops at a terminal
+    /// chunk, so everything after it is dropped.
+    #[tokio::test]
+    async fn compat_does_not_mark_a_multi_line_event_ending_in_the_marker() {
+        let chunks = compat_chunks_for_reads(&[
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(
+            chunks.iter().all(|c| !c.is_final),
+            "an event whose payload is more than the bare marker is not the terminator"
+        );
+    }
+
+    /// A stream that never sends the terminator marks nothing. The handler's fallback covers it;
+    /// asserting a completion here would be a lie about an upstream that simply stopped.
+    #[tokio::test]
+    async fn compat_marks_nothing_when_the_stream_ends_without_a_done_line() {
+        let chunks = compat_chunks_for_reads(&[
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        ])
+        .await;
+
+        assert!(
+            chunks.iter().all(|c| !c.is_final),
+            "no chunk may claim a completion the upstream never signalled"
         );
     }
 }

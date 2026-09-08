@@ -37,6 +37,12 @@ pub(super) struct GuardedStream {
     pub(super) tracker: Arc<crate::providers::health::ProviderHealthTracker>,
     pub(super) provider_name: String,
     pub(super) stream_start: Instant,
+    /// Set once the success signal has been reported, so it is reported exactly once.
+    ///
+    /// A response has two possible last observations — a chunk the adapter marked terminal, or
+    /// end of stream — and a consumer may see either. Whichever comes first reports; the other
+    /// then does nothing.
+    pub(super) reported: bool,
 }
 
 // Pin<Box<T>>: Unpin because Box<T>: Unpin. Arc<T>: Unpin.
@@ -45,6 +51,22 @@ impl Unpin for GuardedStream {}
 impl std::fmt::Debug for GuardedStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardedStream").finish_non_exhaustive()
+    }
+}
+
+impl GuardedStream {
+    /// Reports a successful response to the health tracker, at most once per stream.
+    ///
+    /// Fire-and-forget: `poll_next` cannot await, so the tracker update is spawned.
+    fn report_response(&mut self) {
+        if self.reported {
+            return;
+        }
+        self.reported = true;
+        let latency_ms = self.stream_start.elapsed().as_secs_f64() * 1000.0;
+        let tracker = Arc::clone(&self.tracker);
+        let name = self.provider_name.clone();
+        tokio::spawn(async move { tracker.on_response(&name, latency_ms).await });
     }
 }
 
@@ -67,11 +89,18 @@ impl Stream for GuardedStream {
                     tokio::spawn(async move { tracker.on_rate_limit(&name).await });
                 }
             }
+            // A chunk the adapter marked terminal ends the response, so it is a completion
+            // observed one poll earlier than end of stream. Reporting here rather than only at
+            // EOF is what keeps the health signal independent of the consumer: a consumer that
+            // stops at the terminal chunk — which is what the handler does, and what an HTTP
+            // client stopping at `data: [DONE]` causes — never produces the EOF poll at all.
+            // Without this the provider's HALF-OPEN probe would never be resolved and its
+            // latency would never be sampled.
+            Poll::Ready(Some(Ok(chunk))) if chunk.is_final => {
+                this.report_response();
+            }
             Poll::Ready(None) => {
-                let latency_ms = this.stream_start.elapsed().as_secs_f64() * 1000.0;
-                let tracker = Arc::clone(&this.tracker);
-                let name = this.provider_name.clone();
-                tokio::spawn(async move { tracker.on_response(&name, latency_ms).await });
+                this.report_response();
             }
             _ => {}
         }
@@ -116,6 +145,7 @@ impl ProviderRouter {
             tracker: Arc::clone(&self.health),
             provider_name,
             stream_start: Instant::now(),
+            reported: false,
         })
     }
 

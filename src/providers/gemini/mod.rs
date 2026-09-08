@@ -432,6 +432,10 @@ impl ProviderAdapter for GeminiAdapter {
         let s = async_stream::stream! {
             let mut reader = BufReader::new(tokio_util::io::StreamReader::new(stream));
             let mut line = String::new();
+            // The terminator below is emitted unconditionally, including after a read failure —
+            // so whether it closes a *completed* response has to be tracked separately. Marking
+            // it after a failure would assert a completion that did not happen.
+            let mut upstream_completed = true;
 
             loop {
                 line.clear();
@@ -442,6 +446,7 @@ impl ProviderAdapter for GeminiAdapter {
                             "gemini: {}",
                             sanitize_network_error(&e.to_string())
                         )));
+                        upstream_completed = false;
                         break;
                     }
                     Ok(_) => {}
@@ -474,7 +479,13 @@ impl ProviderAdapter for GeminiAdapter {
                     line.clear();
                     let usage_chunk: Option<GeminiChatResponse> = match reader.read_line(&mut line).await {
                         Ok(0) => None,
-                        Err(_) => None,
+                        Err(_) => {
+                            // The body was cut short after the model's last content chunk. That
+                            // chunk is still forwarded — it was fully received — but the response
+                            // never ended, so the terminator below must not claim it did.
+                            upstream_completed = false;
+                            None
+                        }
                         Ok(_) => {
                             let trimmed = line.trim();
                             if trimmed.is_empty() {
@@ -520,11 +531,14 @@ impl ProviderAdapter for GeminiAdapter {
                 }
             }
 
-            yield Ok(StreamChunk::new(
-                bytes::Bytes::from("data: [DONE]\n\n"),
-                None,
-                Some(model_clone.clone()),
-            ));
+            yield Ok(StreamChunk {
+                is_final: upstream_completed,
+                ..StreamChunk::new(
+                    bytes::Bytes::from("data: [DONE]\n\n"),
+                    None,
+                    Some(model_clone.clone()),
+                )
+            });
         };
 
         Ok(Box::pin(s))

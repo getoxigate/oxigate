@@ -18,6 +18,39 @@ use oxigate::redis_pool::create_pool;
 
 use metrics_exporter_prometheus::PrometheusHandle;
 
+/// Exactly the last chunk is terminal, and every chunk before it is not.
+///
+/// Shared because every adapter lane asserts the same shape: the terminal-chunk contract is that
+/// one chunk closes a completed response and nothing before it claims to.
+pub fn assert_only_last_is_final(chunks: &[oxigate::domain::chat::StreamChunk]) {
+    let marked: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_final)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        marked,
+        vec![chunks.len() - 1],
+        "exactly the last chunk must be terminal, got marks at {marked:?} of {} chunks",
+        chunks.len()
+    );
+}
+
+/// The bundled pricing catalogue in a hot-reload holder.
+///
+/// Every provider adapter that accounts cache writes takes this holder so it can snapshot one
+/// pricing generation per request. Most tests are not about pricing and just need a real one.
+pub fn bundled_pricing_holder()
+-> std::sync::Arc<std::sync::RwLock<oxigate::domain::pricing::PricingDb>> {
+    let db = oxigate::domain::pricing::PricingDb::load(
+        oxigate::domain::pricing::BUNDLED_PRICING_JSON,
+        &oxigate::config::PricingConfig::default(),
+    )
+    .expect("bundled pricing DB loads");
+    std::sync::Arc::new(std::sync::RwLock::new(db))
+}
+
 /// Lazy (never-connecting) PG pool for tests that need an AppState but do not touch the DB.
 pub fn lazy_pg_pool() -> oxigate::db::DbPool {
     sqlx::postgres::PgPoolOptions::new()

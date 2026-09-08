@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use oxigate::api::EMBEDDINGS_PATH;
 use oxigate::config::{AuthConfig, BudgetConfig, OpenAIConfig, SecretString};
+use oxigate::domain::usage_accounting::CostStatus;
 use oxigate::providers::openai::OpenAiAdapter;
 use oxigate::utils::CostHeader;
 
@@ -35,15 +36,18 @@ async fn test_embeddings_e2e_cost_headers() {
     wiremock_stubs::stub_openai_embeddings(&mock, "text-embedding-3-small", 42).await;
 
     let provider = Arc::new(
-        OpenAiAdapter::new(OpenAIConfig {
-            api_key: Some(SecretString::new("sk-test")),
-            api_base_url: Some(mock.uri().trim_end_matches('/').to_string()),
-            default_model: None,
-            timeout_secs: Some(10),
-            supported_models: None,
-            organization: None,
-            project: None,
-        })
+        OpenAiAdapter::new(
+            OpenAIConfig {
+                api_key: Some(SecretString::new("sk-test")),
+                api_base_url: Some(mock.uri().trim_end_matches('/').to_string()),
+                default_model: None,
+                timeout_secs: Some(10),
+                supported_models: None,
+                organization: None,
+                project: None,
+            },
+            crate::common::bundled_pricing_holder(),
+        )
         .await
         .expect("OpenAiAdapter must build"),
     );
@@ -101,6 +105,17 @@ async fn test_embeddings_e2e_cost_headers() {
         Some("0"),
         "embeddings must always report zero output tokens"
     );
+
+    // Embeddings are buffered-only, so the response header is the sole place a client can read
+    // the request-wide cost status. text-embedding-3-small has known bundled pricing and this
+    // usage is clean, so the exact status is the only acceptable value.
+    assert_eq!(
+        headers
+            .get(CostHeader::COST_STATUS)
+            .and_then(|v| v.to_str().ok()),
+        Some(CostStatus::Exact.as_str()),
+        "buffered embeddings response must carry the exact cost status its pricing produced"
+    );
 }
 
 /// POST /v1/embeddings with a provider error → zero cost headers present (no panic).
@@ -119,15 +134,18 @@ async fn test_embeddings_e2e_provider_error_zero_cost_headers() {
     mock.register(err_mock).await;
 
     let provider = Arc::new(
-        OpenAiAdapter::new(OpenAIConfig {
-            api_key: Some(SecretString::new("sk-test")),
-            api_base_url: Some(mock.uri().trim_end_matches('/').to_string()),
-            default_model: None,
-            timeout_secs: Some(10),
-            supported_models: None,
-            organization: None,
-            project: None,
-        })
+        OpenAiAdapter::new(
+            OpenAIConfig {
+                api_key: Some(SecretString::new("sk-test")),
+                api_base_url: Some(mock.uri().trim_end_matches('/').to_string()),
+                default_model: None,
+                timeout_secs: Some(10),
+                supported_models: None,
+                organization: None,
+                project: None,
+            },
+            crate::common::bundled_pricing_holder(),
+        )
         .await
         .expect("OpenAiAdapter must build"),
     );
@@ -184,9 +202,12 @@ async fn test_embeddings_e2e_batch_input_cost_headers() {
     wiremock_stubs::stub_openai_embeddings_batch(&mock, "text-embedding-3-small", 3, 90).await;
 
     let provider = Arc::new(
-        OpenAiAdapter::new(openai_adapter(&mock.uri()))
-            .await
-            .expect("adapter must build"),
+        OpenAiAdapter::new(
+            openai_adapter(&mock.uri()),
+            crate::common::bundled_pricing_holder(),
+        )
+        .await
+        .expect("adapter must build"),
     );
     let gateway = TestGateway::spawn(pg.pool.clone(), redis.pool.clone(), provider).await;
 
@@ -296,9 +317,12 @@ async fn test_embeddings_e2e_dimensions_param_forwarded() {
     wiremock_stubs::stub_openai_embeddings(&mock, "text-embedding-3-large", 10).await;
 
     let provider = Arc::new(
-        OpenAiAdapter::new(openai_adapter(&mock.uri()))
-            .await
-            .expect("adapter must build"),
+        OpenAiAdapter::new(
+            openai_adapter(&mock.uri()),
+            crate::common::bundled_pricing_holder(),
+        )
+        .await
+        .expect("adapter must build"),
     );
     let gateway = TestGateway::spawn(pg.pool.clone(), redis.pool.clone(), provider).await;
 

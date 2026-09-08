@@ -38,12 +38,22 @@ fn openai_chat_response(
     })
 }
 
+/// An OpenAI reasoning-model response.
+///
+/// `reasoning_tokens` is a **breakdown of** `completion_tokens`, not an addition to it, so callers
+/// must pass `reasoning_tokens <= completion_tokens` and `total_tokens` sums only the prompt and
+/// completion totals. A fixture that adds reasoning on top of the completion total describes a
+/// payload OpenAI does not emit.
 fn openai_chat_response_with_reasoning(
     prompt_tokens: u32,
     completion_tokens: u32,
     reasoning_tokens: u32,
     text: &str,
 ) -> serde_json::Value {
+    assert!(
+        reasoning_tokens <= completion_tokens,
+        "reasoning_tokens is a subset of completion_tokens under the OpenAI contract"
+    );
     serde_json::json!({
         "id": "chatcmpl-test",
         "object": "chat.completion",
@@ -60,7 +70,7 @@ fn openai_chat_response_with_reasoning(
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens + reasoning_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
             "completion_tokens_details": {
                 "reasoning_tokens": reasoning_tokens
             }
@@ -92,7 +102,7 @@ async fn test_openai_chat_completion_non_streaming() {
         .await;
 
     let config = openai_config(mock.uri().trim_end_matches('/'));
-    let adapter = OpenAiAdapter::new(config)
+    let adapter = OpenAiAdapter::new(config, crate::common::bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -144,7 +154,7 @@ async fn test_openai_chat_completion_streaming() {
         .await;
 
     let config = openai_config(mock.uri().trim_end_matches('/'));
-    let adapter = OpenAiAdapter::new(config)
+    let adapter = OpenAiAdapter::new(config, crate::common::bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -199,7 +209,7 @@ data: [DONE]
         .await;
 
     let config = openai_config(mock.uri().trim_end_matches('/'));
-    let adapter = OpenAiAdapter::new(config)
+    let adapter = OpenAiAdapter::new(config, crate::common::bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -246,7 +256,7 @@ async fn test_openai_429_preserves_retry_after() {
         .await;
 
     let config = openai_config(mock.uri().trim_end_matches('/'));
-    let adapter = OpenAiAdapter::new(config)
+    let adapter = OpenAiAdapter::new(config, crate::common::bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -289,7 +299,7 @@ async fn test_openai_auth_header_sent() {
         .await;
 
     let config = openai_config(mock.uri().trim_end_matches('/'));
-    let adapter = OpenAiAdapter::new(config)
+    let adapter = OpenAiAdapter::new(config, crate::common::bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -329,7 +339,7 @@ async fn test_openai_organization_header() {
         .mount(&mock)
         .await;
 
-    let adapter = OpenAiAdapter::new(config)
+    let adapter = OpenAiAdapter::new(config, crate::common::bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -358,7 +368,7 @@ async fn test_openai_organization_header() {
 #[tokio::test]
 async fn test_openai_reasoning_model_e2e() {
     let mock = MockServer::start().await;
-    let body = openai_chat_response_with_reasoning(5, 10, 100, "Reasoned answer");
+    let body = openai_chat_response_with_reasoning(5, 120, 100, "Reasoned answer");
     // Verify upstream request has system→developer remapping and max_tokens→max_completion_tokens
     let expected_upstream = serde_json::json!({
         "messages": [{ "role": "developer", "content": "You are helpful." }],
@@ -372,7 +382,7 @@ async fn test_openai_reasoning_model_e2e() {
         .await;
 
     let config = openai_config(mock.uri().trim_end_matches('/'));
-    let adapter = OpenAiAdapter::new(config)
+    let adapter = OpenAiAdapter::new(config, crate::common::bundled_pricing_holder())
         .await
         .expect("adapter must build");
 
@@ -406,7 +416,7 @@ async fn test_openai_reasoning_model_e2e() {
         .chat_completion(&req)
         .await
         .expect("chat must succeed");
-    assert_eq!(resp.usage.completion_tokens, 10);
+    assert_eq!(resp.usage.completion_tokens, 120);
     assert_eq!(
         resp.usage
             .completion_tokens_details

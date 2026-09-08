@@ -136,6 +136,12 @@ pub struct PricingOverride {
     /// Fraction of input_per_token for cache-read tokens.
     #[serde(default)]
     pub cache_read_multiplier: Option<f64>,
+    /// Multiplier per cache-write class, keyed by canonical duration (e.g. `"5m"`, `"1h"`).
+    ///
+    /// Complete replacement, not a merge: an override that omits this does not inherit the
+    /// baseline model's map, so the visible fallback rate applies to every class.
+    #[serde(default)]
+    pub cache_write_multipliers: std::collections::HashMap<String, f64>,
 }
 
 /// Pricing configuration (YAML overrides). Empty by default.
@@ -759,9 +765,9 @@ pub struct BudgetCapEntry {
 ///
 /// Hot-reload class: A (in-memory swap — no pool rebuild needed).
 ///
-/// Community: crash-recovery Redis seeding, `global_safety_cap_usd`, and optional
-/// `budget_duration` / `timezone` for period-keyed identity spend .
-/// Soft/hard per-identity caps, dedup TTL derived from `budget_duration`, and optional scheduler.
+/// Covers crash-recovery Redis seeding, `global_safety_cap_usd`, soft/hard per-identity caps,
+/// optional `budget_duration` / `timezone` for period-keyed identity spend, a dedup TTL derived
+/// from `budget_duration`, and the optional reset scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetConfig {
     /// Lower bound for Postgres aggregation during Redis seeding (crash recovery).
@@ -812,8 +818,8 @@ pub struct BudgetConfig {
     pub scheduler_interval_secs: u64,
     /// Per-team soft/hard caps (USD). Key = team name from `X-Oxigate-Team` header or tags.
     ///
-    /// Community tier. Inherits `budget_duration` and `timezone` from this `BudgetConfig` —
-    /// no per-team custom cadence.
+    /// Inherits `budget_duration` and `timezone` from this `BudgetConfig` — no per-team
+    /// custom cadence.
     ///
     /// **Warning**: do not configure keys of the form `"team:*"` in `tag_budgets` alongside
     /// team entries — the spend writer writes a `tag:team:{name}:spend` key unconditionally,
@@ -825,7 +831,7 @@ pub struct BudgetConfig {
     /// Per-tag soft/hard caps (USD). Key = full `"key:value"` string (e.g. `"project:chat-bot"`),
     /// matching the format produced by `format!("{k}:{v}")` from `RequestIdentity.tags` entries.
     ///
-    /// Community tier. Inherits `budget_duration` and `timezone` from this `BudgetConfig`.
+    /// Inherits `budget_duration` and `timezone` from this `BudgetConfig`.
     #[serde(default)]
     pub tag_budgets: HashMap<String, BudgetCapEntry>,
 }
@@ -1059,15 +1065,15 @@ impl GatewayConfig {
         }
 
         for (model_key, ov) in &self.pricing.overrides {
-            if ov.input_per_token < 0.0 {
+            if !crate::domain::pricing::rate_is_representable(ov.input_per_token) {
                 errors.push(format!(
-                    "pricing.overrides[{}]: input_per_token must be >= 0",
+                    "pricing.overrides[{}]: input_per_token must be finite, >= 0 and representable in nano-USD",
                     model_key
                 ));
             }
-            if ov.output_per_token < 0.0 {
+            if !crate::domain::pricing::rate_is_representable(ov.output_per_token) {
                 errors.push(format!(
-                    "pricing.overrides[{}]: output_per_token must be >= 0",
+                    "pricing.overrides[{}]: output_per_token must be finite, >= 0 and representable in nano-USD",
                     model_key
                 ));
             }
@@ -1079,6 +1085,10 @@ impl GatewayConfig {
                     model_key
                 ));
             }
+            errors.extend(crate::domain::pricing::validate_cache_write_multipliers(
+                &format!("pricing.overrides[{}]", model_key),
+                &ov.cache_write_multipliers,
+            ));
         }
 
         if let Some(cap) = self.budget.global_safety_cap_usd
@@ -2190,6 +2200,7 @@ log_level: "info"
                 output_per_token: 0.04,
                 context_window: 128_000,
                 cache_read_multiplier: None,
+                cache_write_multipliers: std::collections::HashMap::new(),
             },
         );
         let err = cfg.validate().unwrap_err();
@@ -2219,6 +2230,7 @@ log_level: "info"
                 output_per_token: -0.04,
                 context_window: 128_000,
                 cache_read_multiplier: None,
+                cache_write_multipliers: std::collections::HashMap::new(),
             },
         );
         let err = cfg.validate().unwrap_err();
@@ -2226,6 +2238,111 @@ log_level: "info"
         let s = err.to_string();
         assert!(s.contains("pricing"));
         assert!(s.contains("output_per_token"));
+    }
+
+    /// Review correction: `< 0.0` alone let `NaN` and `Infinity` load clean (both compare
+    /// `false` against `< 0.0`). `input_per_token`/`output_per_token` must reject every
+    /// non-representable rate, not only negative ones.
+    #[test]
+    fn test_validate_pricing_override_non_finite_input_rejected() {
+        let mut cfg = GatewayConfig {
+            database: DatabaseConfig {
+                url: SecretString::from("postgres://x/y"),
+                ..Default::default()
+            },
+            redis: RedisConfig {
+                url: SecretString::from("redis://x"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            cfg.pricing.overrides.insert(
+                "gpt-4".into(),
+                PricingOverride {
+                    input_per_token: bad,
+                    output_per_token: 0.04,
+                    context_window: 128_000,
+                    cache_read_multiplier: None,
+                    cache_write_multipliers: std::collections::HashMap::new(),
+                },
+            );
+            let err = cfg.validate().unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid(_)));
+            let s = err.to_string();
+            assert!(
+                s.contains("input_per_token"),
+                "input_per_token={bad} must be rejected: {s}"
+            );
+        }
+    }
+
+    /// Review correction: same as above, for `output_per_token`.
+    #[test]
+    fn test_validate_pricing_override_non_finite_output_rejected() {
+        let mut cfg = GatewayConfig {
+            database: DatabaseConfig {
+                url: SecretString::from("postgres://x/y"),
+                ..Default::default()
+            },
+            redis: RedisConfig {
+                url: SecretString::from("redis://x"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            cfg.pricing.overrides.insert(
+                "gpt-4".into(),
+                PricingOverride {
+                    input_per_token: 0.01,
+                    output_per_token: bad,
+                    context_window: 128_000,
+                    cache_read_multiplier: None,
+                    cache_write_multipliers: std::collections::HashMap::new(),
+                },
+            );
+            let err = cfg.validate().unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid(_)));
+            let s = err.to_string();
+            assert!(
+                s.contains("output_per_token"),
+                "output_per_token={bad} must be rejected: {s}"
+            );
+        }
+    }
+
+    /// Review correction: a finite but astronomically large rate — not negative, not non-finite
+    /// — must also fail. `1e30` is a real value a fat-fingered override could produce and would
+    /// silently overflow nano-USD arithmetic downstream if it reached `apply_override`.
+    #[test]
+    fn test_validate_pricing_override_finite_huge_rate_rejected() {
+        let mut cfg = GatewayConfig {
+            database: DatabaseConfig {
+                url: SecretString::from("postgres://x/y"),
+                ..Default::default()
+            },
+            redis: RedisConfig {
+                url: SecretString::from("redis://x"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.pricing.overrides.insert(
+            "gpt-4".into(),
+            PricingOverride {
+                input_per_token: 1e30,
+                output_per_token: 0.04,
+                context_window: 128_000,
+                cache_read_multiplier: None,
+                cache_write_multipliers: std::collections::HashMap::new(),
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)));
+        let s = err.to_string();
+        assert!(s.contains("input_per_token"));
+        assert!(s.contains("representable"));
     }
 
     #[test]
@@ -2248,6 +2365,7 @@ log_level: "info"
                 output_per_token: 0.04,
                 context_window: 128_000,
                 cache_read_multiplier: Some(11.0),
+                cache_write_multipliers: std::collections::HashMap::new(),
             },
         );
         let err = cfg.validate().unwrap_err();
@@ -2255,6 +2373,72 @@ log_level: "info"
         let s = err.to_string();
         assert!(s.contains("pricing"));
         assert!(s.contains("cache_read_multiplier"));
+    }
+
+    /// AC14: an out-of-range override cache-write multiplier fails config validation.
+    #[test]
+    fn test_validate_pricing_override_invalid_cache_write_multiplier() {
+        let mut cfg = GatewayConfig {
+            database: DatabaseConfig {
+                url: SecretString::from("postgres://x/y"),
+                ..Default::default()
+            },
+            redis: RedisConfig {
+                url: SecretString::from("redis://x"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.pricing.overrides.insert(
+            "gpt-4".into(),
+            PricingOverride {
+                input_per_token: 0.01,
+                output_per_token: 0.04,
+                context_window: 128_000,
+                cache_read_multiplier: None,
+                cache_write_multipliers: std::collections::HashMap::from([(
+                    "5m".to_string(),
+                    11.0,
+                )]),
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)));
+        let s = err.to_string();
+        assert!(s.contains("pricing.overrides"));
+        assert!(s.contains("cache_write_multipliers"));
+    }
+
+    /// AC14c: a non-duration key in an override's cache-write map fails config validation.
+    #[test]
+    fn test_validate_pricing_override_invalid_cache_write_key() {
+        let mut cfg = GatewayConfig {
+            database: DatabaseConfig {
+                url: SecretString::from("postgres://x/y"),
+                ..Default::default()
+            },
+            redis: RedisConfig {
+                url: SecretString::from("redis://x"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.pricing.overrides.insert(
+            "gpt-4".into(),
+            PricingOverride {
+                input_per_token: 0.01,
+                output_per_token: 0.04,
+                context_window: 128_000,
+                cache_read_multiplier: None,
+                cache_write_multipliers: std::collections::HashMap::from([(
+                    "not-a-duration".to_string(),
+                    1.0,
+                )]),
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)));
+        assert!(err.to_string().contains("not a canonical"));
     }
 
     #[test]
@@ -2277,6 +2461,7 @@ log_level: "info"
                 output_per_token: 0.0,
                 context_window: 128_000,
                 cache_read_multiplier: Some(0.5),
+                cache_write_multipliers: std::collections::HashMap::new(),
             },
         );
         assert!(cfg.validate().is_ok());
@@ -2387,6 +2572,7 @@ log_level: "info"
                 output_per_token: 0.04,
                 context_window: 200_000,
                 cache_read_multiplier: None,
+                cache_write_multipliers: std::collections::HashMap::new(),
             },
         );
         assert_eq!(classify_reload(&old, &new), HotReloadClass::ClassA);

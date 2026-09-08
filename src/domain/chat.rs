@@ -8,6 +8,8 @@
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::domain::usage_accounting::CacheWriteAccounting;
+
 /// Conversation role. `Other` preserves unknown values for passthrough.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -194,11 +196,51 @@ pub struct CompletionTokensDetails {
 /// so new providers must choose, avoiding accidental under-billing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CacheAccounting {
-    /// OpenAI: prompt_tokens is total (plain + cached); subtract cache_read to get billable input.
+    /// `prompt_tokens` already contains the cached tokens, so every cache bucket the gateway
+    /// **accounted** is carved out of it to get the billable plain input.
+    ///
+    /// The carve-out is driven by what a lane populated, not by what the provider's wire format
+    /// can express: a bucket the lane did not account is not subtracted, because subtracting a
+    /// quantity nothing priced would undercharge. Declared by OpenAI, Azure, Gemini and the
+    /// generic OpenAI-compatible default — but those lanes do not populate the same buckets.
+    /// Compat normalizes **cache-read only**; a third-party backend's cache-write semantics have
+    /// no first-party reference, so its `cache_write_tokens` is echoed and never accounted, and
+    /// nothing is carved out for it.
     #[default]
     Inclusive,
-    /// Anthropic/Gemini: prompt_tokens is plain-only; cache_read is additive.
+    /// `prompt_tokens` is the plain portion only; the cache buckets are reported beside it and
+    /// are charged in addition to it. Declared by Anthropic and Bedrock.
     Additive,
+}
+
+/// How reasoning tokens relate to `completion_tokens` for cost calculation.
+///
+/// Providers differ, so the axis has to be declared rather than assumed. Pricing the reported
+/// completion total *and* the reasoning breakdown at the output rate charges the reasoning subset
+/// twice wherever it is already contained in that total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningAccounting {
+    /// Reasoning tokens are reported outside the completion total; charge them beside it.
+    #[default]
+    Additive,
+    /// Reasoning tokens are already contained in the completion total; carve them out before
+    /// charging the remainder at the standard output rate.
+    IncludedInOutput,
+}
+
+/// The token accounting semantics of the provider contract that produced a `Usage`.
+///
+/// One value carries both axes so a provider contract has a single place to declare them, and so
+/// a new axis cannot be added to one construction site and forgotten at another.
+///
+/// Both axes default to this gateway's historical behaviour, so a construction site that has not
+/// been given its contract's declaration bills exactly as it did before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UsageAccounting {
+    /// How cache tokens relate to `prompt_tokens`.
+    pub cache: CacheAccounting,
+    /// How reasoning tokens relate to `completion_tokens`.
+    pub reasoning: ReasoningAccounting,
 }
 
 /// Details about prompt token usage (OpenAI KV-cache).
@@ -207,6 +249,12 @@ pub struct PromptTokensDetails {
     /// KV-cache read tokens (billed at reduced rate).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
+    /// KV-cache write tokens — "the unadjusted number of prompt tokens written to cache".
+    ///
+    /// Reported inside `prompt_tokens` rather than beside it, so the quantity is a breakdown of
+    /// the prompt total and not an addition to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// Token usage from the provider response.
@@ -222,7 +270,11 @@ pub struct Usage {
     /// thinking tokens (Gemini 2.5+, Claude extended thinking, OpenAI o-series).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
-    /// Cache creation (write) input tokens (Anthropic differential pricing).
+    /// Accounted cache creation (write) input tokens.
+    ///
+    /// This is the single quantity the request is billed and budgeted on, reconciled from
+    /// whatever the provider reported — aggregate, per-class details, or both. Per-class
+    /// quantities are in `cache_write`; they are gateway-internal and are not published here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
     /// Cache read input tokens (Anthropic differential pricing).
@@ -231,28 +283,23 @@ pub struct Usage {
     /// OpenAI prompt_tokens_details (cached_tokens for KV-cache).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
-    /// Tier threshold override for Gemini (input+cached for Google AI Studio).
-    #[serde(skip)]
-    pub tier_threshold_override: Option<u64>,
-    /// How cache tokens relate to prompt_tokens (Inclusive vs Additive).
+    /// Token accounting semantics declared by the provider contract that produced this usage.
     #[serde(skip, default)]
-    pub cache_accounting: CacheAccounting,
+    pub accounting: UsageAccounting,
+    /// Generalized cache-write accounting for this response, and the pricing generation the
+    /// request was dispatched under.
+    ///
+    /// `skip` keeps it off the wire in both directions — it is gateway-internal state, not part
+    /// of the OpenAI-compatible usage schema — and `default` is what keeps `Usage` deserializable
+    /// without it.
+    #[serde(skip, default)]
+    pub cache_write: CacheWriteAccounting,
     /// Image units billed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_units: Option<u64>,
     /// Audio seconds billed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_seconds: Option<f64>,
-    /// Cache creation tokens with 5-minute TTL (Anthropic differential pricing).
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
-    pub cache_creation_5m_tokens: u64,
-    /// Cache creation tokens with 1-hour TTL (Anthropic differential pricing).
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
-    pub cache_creation_1h_tokens: u64,
-}
-
-fn u64_is_zero(v: &u64) -> bool {
-    *v == 0
 }
 
 /// A chunk of SSE stream data. Used for streaming chat completions.
@@ -265,14 +312,64 @@ pub struct StreamChunk {
     pub usage: Option<Usage>,
     /// Resolved model name from provider chunk . First non-None wins for CostHeader::MODEL_USED.
     pub model: Option<String>,
+    /// Marks this chunk as the adapter's clean terminal chunk. **Required adapter contract.**
+    ///
+    /// Set `true` on, and only on, a chunk after which the adapter will emit no further chunks
+    /// *because the upstream response completed normally*. For the OpenAI-compatible wire shape
+    /// that is the chunk that **completes the `data: [DONE]` event** — the event is not dispatched
+    /// until the blank line closing it, so an adapter forwarding raw bytes may find that the
+    /// completing chunk carries nothing but that separator. Marking the chunk that carried the
+    /// marker line instead leaves the event unterminated on the wire, and everything the gateway
+    /// appends after it merges into that event.
+    ///
+    /// Do **not** set it on a chunk that terminates an aborted, degraded or error-interrupted
+    /// stream, even when that chunk is the last one the adapter emits. Marking such a chunk
+    /// asserts a completion that did not happen. A gateway-synthesized termination event —
+    /// emitted because the adapter gave up rather than because the provider finished — is the
+    /// in-tree example, and it deliberately leaves this flag `false`.
+    ///
+    /// What honouring the contract buys: the gateway schedules the request's accounting — cost
+    /// computation, the cost metric, the cost log line, and the spend-record write — *before*
+    /// forwarding the marked chunk, so the request is accounted even when the client stops
+    /// reading at that chunk. Many HTTP clients stop reading at `data: [DONE]` and never poll the
+    /// response body again.
+    ///
+    /// The default is `false`, so this is opt-in: an adapter that leaves it unset still works,
+    /// but loses the accounting for any request whose client stops reading at its last chunk.
+    ///
+    /// Marking a chunk does not change where usage comes from. Accounting uses the most recent
+    /// [`usage`](StreamChunk::usage) reported by *any* chunk of the stream, so a terminal chunk
+    /// that carries none — a common shape, since several providers report usage on an earlier
+    /// event and end with a bare terminator — is still billed from what was observed before it.
+    /// Set `usage` wherever the provider actually reports it.
+    pub is_final: bool,
 }
 
 impl StreamChunk {
     /// Creates a stream chunk. Use this instead of struct literal when the struct may gain
     /// fields (#[non_exhaustive]).
+    ///
+    /// The chunk is **not** marked terminal. An adapter marking its clean terminal chunk assigns
+    /// the field after constructing:
+    ///
+    /// ```
+    /// # use bytes::Bytes;
+    /// # use oxigate::domain::chat::StreamChunk;
+    /// let mut chunk = StreamChunk::new(Bytes::from_static(b"data: [DONE]\n\n"), None, None);
+    /// chunk.is_final = true;
+    /// ```
+    ///
+    /// Field assignment rather than struct-update syntax, because `#[non_exhaustive]` forbids
+    /// every struct expression — `..` included — outside this crate. See
+    /// [`StreamChunk::is_final`] for when marking is correct.
     #[must_use]
     pub fn new(data: Bytes, usage: Option<Usage>, model: Option<String>) -> Self {
-        Self { data, usage, model }
+        Self {
+            data,
+            usage,
+            model,
+            is_final: false,
+        }
     }
 }
 
@@ -282,6 +379,7 @@ impl Default for StreamChunk {
             data: Bytes::new(),
             usage: None,
             model: None,
+            is_final: false,
         }
     }
 }
@@ -289,6 +387,25 @@ impl Default for StreamChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The public usage schema publishes the accounted cache-write quantity and nothing about
+    /// how it was classified. Per-class quantities are gateway-internal: a client cannot depend
+    /// on a class name, and adding a class cannot change the response shape.
+    #[test]
+    fn test_usage_publishes_only_the_accounted_cache_write_quantity() {
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cache_creation_input_tokens: Some(3500),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&usage).expect("usage serialises");
+        assert!(json.contains("\"cache_creation_input_tokens\":3500"));
+        assert!(!json.contains("cache_creation_5m_tokens"));
+        assert!(!json.contains("cache_creation_1h_tokens"));
+        assert!(!json.contains("cache_write"));
+    }
 
     #[test]
     fn test_usage_serialises_completion_tokens_details_when_thinking() {
@@ -302,12 +419,10 @@ mod tests {
             prompt_tokens_details: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
-            tier_threshold_override: None,
-            cache_accounting: CacheAccounting::Inclusive,
+            accounting: UsageAccounting::default(),
             image_units: None,
             audio_seconds: None,
-            cache_creation_5m_tokens: 0,
-            cache_creation_1h_tokens: 0,
+            ..Default::default()
         };
         let json = serde_json::to_value(&usage).expect("serialise");
         assert!(json.get("completion_tokens_details").is_some());
@@ -327,15 +442,28 @@ mod tests {
             prompt_tokens_details: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
-            tier_threshold_override: None,
-            cache_accounting: CacheAccounting::Inclusive,
+            accounting: UsageAccounting::default(),
             image_units: None,
             audio_seconds: None,
-            cache_creation_5m_tokens: 0,
-            cache_creation_1h_tokens: 0,
+            ..Default::default()
         };
         let json = serde_json::to_value(&usage).expect("serialise");
         assert!(json.get("completion_tokens_details").is_none());
+    }
+
+    /// The accounting defaults are this gateway's pre-existing behaviour on both axes, so an
+    /// un-declared construction site cannot move a billed amount.
+    #[test]
+    fn test_usage_accounting_defaults_preserve_existing_behaviour() {
+        let accounting = UsageAccounting::default();
+        assert_eq!(accounting.cache, CacheAccounting::Inclusive);
+        assert_eq!(accounting.reasoning, ReasoningAccounting::Additive);
+    }
+
+    /// `Usage::default()` carries the default accounting rather than an unset value.
+    #[test]
+    fn test_usage_default_carries_default_accounting() {
+        assert_eq!(Usage::default().accounting, UsageAccounting::default());
     }
 
     /// image_units omitted when None.
@@ -429,6 +557,22 @@ mod tests {
                 .get("custom_key")
                 .and_then(|v| v.as_str()),
             Some("custom_value")
+        );
+    }
+
+    /// A chunk is not terminal unless an adapter says so. Both constructors must agree on that
+    /// default: it is what lets an adapter that has never heard of the terminal-chunk contract
+    /// keep compiling, at the cost of the accounting guarantee rather than at the cost of
+    /// asserting a completion that never happened.
+    #[test]
+    fn test_stream_chunk_is_not_terminal_by_default() {
+        assert!(
+            !StreamChunk::default().is_final,
+            "Default must not assert a completed upstream response"
+        );
+        assert!(
+            !StreamChunk::new(Bytes::from_static(b"data: {}\n\n"), None, None).is_final,
+            "new() must not assert a completed upstream response"
         );
     }
 }

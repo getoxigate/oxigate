@@ -65,12 +65,15 @@ pub async fn build_from_config(
     let mut provider_names: Vec<String> = Vec::new();
 
     if let Some(ref openai_cfg) = config.providers.openai {
-        let adapter = Arc::new(OpenAiAdapter::new(openai_cfg.clone()).await?);
+        let adapter =
+            Arc::new(OpenAiAdapter::new(openai_cfg.clone(), Arc::clone(&pricing_db)).await?);
         provider_names.push(adapter.metadata().name.clone());
         providers.push(adapter as Arc<dyn ProviderAdapter>);
     }
     if let Some(ref anthropic_config) = config.providers.anthropic {
-        let adapter = Arc::new(AnthropicAdapter::new(anthropic_config.clone()).await?);
+        let adapter = Arc::new(
+            AnthropicAdapter::new(anthropic_config.clone(), Arc::clone(&pricing_db)).await?,
+        );
         provider_names.push(adapter.metadata().name.clone());
         providers.push(adapter as Arc<dyn ProviderAdapter>);
     }
@@ -80,7 +83,8 @@ pub async fn build_from_config(
         providers.push(adapter as Arc<dyn ProviderAdapter>);
     }
     if let Some(ref bedrock_cfg) = config.providers.bedrock {
-        let adapter = Arc::new(BedrockAdapter::new(bedrock_cfg.clone()).await?);
+        let adapter =
+            Arc::new(BedrockAdapter::new(bedrock_cfg.clone(), Arc::clone(&pricing_db)).await?);
         provider_names.push(adapter.metadata().name.clone());
         providers.push(adapter as Arc<dyn ProviderAdapter>);
     }
@@ -99,8 +103,14 @@ pub async fn build_from_config(
     if !config.providers.azure.is_empty() {
         let azure_http = Arc::new(CompatHttpClient::new()?);
         for azure_cfg in &config.providers.azure {
-            let adapter =
-                Arc::new(AzureAdapter::new(azure_cfg.clone(), Arc::clone(&azure_http)).await?);
+            let adapter = Arc::new(
+                AzureAdapter::new(
+                    azure_cfg.clone(),
+                    Arc::clone(&azure_http),
+                    Arc::clone(&pricing_db),
+                )
+                .await?,
+            );
             provider_names.push(adapter.metadata().name.clone());
             providers.push(adapter as Arc<dyn ProviderAdapter>);
         }

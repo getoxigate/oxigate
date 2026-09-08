@@ -33,10 +33,163 @@ use crate::domain::ports::{AttemptedMeta, ProviderError};
 use crate::domain::spend::SpendRecord;
 use crate::middleware::request_metrics::ProviderLabel;
 use crate::observability::metrics::{COST_USD_TOTAL, ENDPOINT_CHAT};
-use crate::utils::{CostHeader, cost_headers};
+use crate::utils::cost_headers;
 
 /// Yield type for chat streaming: Bytes on success, Infallible (never Err).
 type ChatStreamItem = Result<Bytes, std::convert::Infallible>;
+
+/// The terminal `oxigate.usage` SSE payload.
+///
+/// Serialized rather than assembled with `format!`, so a member that needs escaping cannot
+/// produce a malformed event. The four cost and token members keep the header names this event
+/// has always used; `cost_status` is the request-wide status, which cannot travel as an HTTP
+/// header on a streamed response because it is not known when the headers are sent.
+#[derive(serde::Serialize)]
+struct UsageEvent<'a> {
+    #[serde(rename = "X-Oxigate-Request-Cost")]
+    request_cost: &'a str,
+    #[serde(rename = "X-Oxigate-Input-Tokens")]
+    input_tokens: String,
+    #[serde(rename = "X-Oxigate-Output-Tokens")]
+    output_tokens: String,
+    #[serde(rename = "X-Oxigate-Model-Used")]
+    model_used: &'a str,
+    cost_status: &'a str,
+}
+
+/// Everything one streamed request's finalization needs, captured before the response body is
+/// created.
+///
+/// Owned rather than borrowed on purpose, and deliberately without a lifetime parameter: the
+/// generator becomes the response body and must be `'static`, so it cannot hold a reference to
+/// `AppState`. Assembling the values once and moving the whole thing across that boundary is what
+/// keeps them together — carrying them as separate locals only defers reassembling them, one
+/// argument at a time, at the point of use.
+struct RequestAccounting {
+    pricing_db: Arc<std::sync::RwLock<crate::domain::pricing::PricingDb>>,
+    pool: Arc<tokio::sync::RwLock<crate::db::DbPool>>,
+    redis: Arc<tokio::sync::RwLock<crate::redis_pool::RedisPool>>,
+    /// Snapshot taken when the request arrived, so a request is priced against the config as it
+    /// was at that moment even if a reload swaps it mid-stream.
+    budget: crate::config::BudgetConfig,
+    identity: RequestIdentity,
+    request_id: String,
+    provider_name: String,
+    batch: bool,
+    content_length: Option<u64>,
+    request_start: std::time::Instant,
+}
+
+/// Finalizes a streamed request's accounting and returns its terminal `oxigate.usage` event.
+///
+/// Prices whatever usage the stream reported — or finalizes the request as cost-unavailable when
+/// it reported none — emits the structured cost log line, increments the cost counter and
+/// schedules the spend write. Row durability stays asynchronous: the database write is a spawned
+/// task here as it is everywhere else. The event bytes are returned rather than sent, because
+/// only the generator that owns the response body can forward them.
+///
+/// **This is a plain `fn`, not an `async fn`, and must stay one.** The caller runs it between
+/// resolving the provider's terminal chunk and forwarding that chunk, and the ordering only buys
+/// anything because nothing can interleave in between: a generator future is cancelled at a
+/// suspension point, and a non-`async fn` cannot contain one. An `.await` added in here is a
+/// compile error, which is the intent — relaxing the signature to allow one would silently
+/// restore the behaviour where a client that stops reading at the last provider chunk is never
+/// accounted at all.
+///
+/// The values it works from are passed rather than captured; that is what lets it be a `fn`
+/// instead of a closure. Everything fixed for the request travels in one [`RequestAccounting`];
+/// the two remaining parameters are exactly the two that differ between the call sites.
+fn finalize_stream_accounting(
+    acct: &RequestAccounting,
+    last_seen_usage: Option<&crate::domain::chat::Usage>,
+    model_used: &str,
+) -> Bytes {
+    // A stream that reported no usage is finalized as cost-unavailable rather than left
+    // traceless: the request happened, and its identity, model, provider and latency are worth
+    // recording even when its cost is not establishable. Both branches produce the same kind of
+    // value, so the tail below runs once over one accounting result.
+    //
+    // On the reported-usage branch the header map is discarded — a streamed response's headers
+    // were sent before the first chunk. Every value the terminal event reports comes from the
+    // finalization result and the usage it was computed from, which is what the headers are built
+    // from on the buffered path, so the two paths cannot drift.
+    //
+    // The two token members are the provider's reported totals, as the buffered path's
+    // INPUT_TOKENS / OUTPUT_TOKENS headers are — not the billing buckets on the accounting, which
+    // split cached tokens out on a cache-inclusive contract. They travel beside the accounting
+    // rather than being read back off it for that reason.
+    let (accounting, prompt_tokens_display, completion_tokens_display) = match last_seen_usage {
+        Some(usage) => (
+            cost_headers::build_cost_headers(
+                model_used,
+                usage,
+                Arc::clone(&acct.pricing_db),
+                acct.batch,
+            )
+            .1,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        ),
+        None => (
+            cost_headers::finalize_missing_usage(
+                model_used,
+                Arc::clone(&acct.pricing_db),
+                acct.batch,
+            ),
+            0,
+            0,
+        ),
+    };
+    cost_headers::report_finalized_warning(&acct.request_id, model_used, &accounting);
+    let cost = accounting.cost.total_cost.to_display_string();
+    let payload = UsageEvent {
+        request_cost: &cost,
+        input_tokens: prompt_tokens_display.to_string(),
+        output_tokens: completion_tokens_display.to_string(),
+        model_used,
+        cost_status: accounting.cost.status.as_str(),
+    };
+    // Integers and short ASCII strings; serialization has no failing case. The fallback keeps the
+    // event well-formed rather than truncating the stream.
+    let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+
+    let latency_ms = i32::try_from(acct.request_start.elapsed().as_millis()).unwrap_or_else(|_| {
+        tracing::warn!("streaming request latency overflows i32; recording -1");
+        -1
+    });
+    let record = SpendRecord::build(
+        &acct.identity,
+        model_used,
+        &acct.provider_name,
+        &accounting,
+        latency_ms,
+    );
+    //: emit per-request cost counter (nano-USD).
+    metrics::counter!(
+        COST_USD_TOTAL,
+        "provider" => acct.provider_name.clone(),
+        "endpoint" => ENDPOINT_CHAT
+    )
+    .increment(accounting.cost.total_cost.as_u64());
+
+    //: request size observability at DEBUG (stays local to chat path).
+    tracing::debug!(
+        request_id = %acct.request_id,
+        request_body_bytes = ?acct.content_length,
+        "chat_request_size"
+    );
+    crate::api::spawn_cost_log_and_spend(
+        "chat_completion_cost",
+        record,
+        &acct.request_id,
+        &cost,
+        Arc::clone(&acct.pool),
+        Arc::clone(&acct.redis),
+        acct.budget.clone(),
+    );
+
+    Bytes::from(format!("event: oxigate.usage\ndata: {data}\n\n"))
+}
 
 /// Chat endpoint error with OpenAI-compatible JSON envelope.
 #[derive(Debug, Error)]
@@ -308,6 +461,76 @@ mod tests {
     use super::*;
     use crate::domain::ports::ProviderError;
 
+    /// The terminal usage event is serialized, not hand-built, and its four legacy members keep
+    /// the exact header names clients already parse. `cost_status` joins them because a streamed
+    /// response cannot carry the status as an HTTP header.
+    #[test]
+    fn test_usage_event_serializes_the_header_names_and_the_status() {
+        use crate::domain::usage_accounting::CostStatus;
+        use crate::utils::CostHeader;
+
+        let payload = UsageEvent {
+            request_cost: "0.001234",
+            input_tokens: "5".to_string(),
+            output_tokens: "2".to_string(),
+            model_used: "gpt-4-0613",
+            cost_status: CostStatus::RateFallback.as_str(),
+        };
+        let data = serde_json::to_string(&payload).expect("payload serializes");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&data).expect("terminal event data must be valid JSON");
+
+        assert_eq!(
+            parsed
+                .get(CostHeader::REQUEST_COST)
+                .and_then(|v| v.as_str()),
+            Some("0.001234")
+        );
+        assert_eq!(
+            parsed
+                .get(CostHeader::INPUT_TOKENS)
+                .and_then(|v| v.as_str()),
+            Some("5")
+        );
+        assert_eq!(
+            parsed
+                .get(CostHeader::OUTPUT_TOKENS)
+                .and_then(|v| v.as_str()),
+            Some("2")
+        );
+        assert_eq!(
+            parsed.get(CostHeader::MODEL_USED).and_then(|v| v.as_str()),
+            Some("gpt-4-0613")
+        );
+        assert_eq!(
+            parsed.get("cost_status").and_then(|v| v.as_str()),
+            Some(CostStatus::RateFallback.as_str())
+        );
+    }
+
+    /// A model name that would need escaping produces valid JSON rather than a malformed event —
+    /// the reason the payload is serialized instead of assembled with `format!`.
+    #[test]
+    fn test_usage_event_escapes_a_model_name_that_needs_it() {
+        use crate::domain::usage_accounting::CostStatus;
+        use crate::utils::CostHeader;
+
+        let payload = UsageEvent {
+            request_cost: "0.000000",
+            input_tokens: "0".to_string(),
+            output_tokens: "0".to_string(),
+            model_used: r#"we"ird\model"#,
+            cost_status: CostStatus::CostUnavailable.as_str(),
+        };
+        let data = serde_json::to_string(&payload).expect("payload serializes");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&data).expect("terminal event data must be valid JSON");
+        assert_eq!(
+            parsed.get(CostHeader::MODEL_USED).and_then(|v| v.as_str()),
+            Some(r#"we"ird\model"#)
+        );
+    }
+
     async fn response_json(r: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(r.into_body(), 1024 * 1024)
             .await
@@ -485,25 +708,44 @@ pub async fn chat_completions(
         } = meta;
         let provider_name = attempted_providers.last().cloned().unwrap_or(provider_name);
         let expose_providers = state.security.read().await.expose_provider_names;
-        let pricing_db = Arc::clone(&state.pricing_db);
         let model = req.model.clone();
-        let identity = identity.clone();
-        let pool = Arc::clone(&state.pool);
-        let redis = Arc::clone(&state.redis_pool);
-        let budget = state.budget_settings.read().await.clone();
-        let request_id = request_id.clone();
         let provider_name_for_ext = provider_name.clone(); //: for response extension
-        // provider_name is moved into body_stream; provider_name_for_ext is used after.
+        // provider_name is moved into `acct`, which is moved into body_stream;
+        // provider_name_for_ext is used after.
+        //
+        // Assembled here, outside the generator, because the generator becomes the response body
+        // and must be `'static`. The budget read in particular has to happen here: it snapshots
+        // the config as of the request's arrival, and taking it inside the generator would move
+        // the snapshot to whenever the stream is first polled.
+        let acct = RequestAccounting {
+            pricing_db: Arc::clone(&state.pricing_db),
+            pool: Arc::clone(&state.pool),
+            redis: Arc::clone(&state.redis_pool),
+            budget: state.budget_settings.read().await.clone(),
+            identity: identity.clone(),
+            request_id: request_id.clone(),
+            provider_name,
+            batch,
+            content_length,
+            request_start,
+        };
         let body_stream = stream! {
             let mut first_model: Option<String> = None;
             let mut last_seen_usage: Option<crate::domain::chat::Usage> = None;
             // Tracks whether the stream ended via an error break. The post-loop emit must
             // only fire on clean EOF — not when the stream was interrupted mid-flight.
             let mut stream_error = false;
+            // Set once accounting has run, so the clean-EOF block below cannot finalize a
+            // request the terminal chunk already finalized.
+            let mut finalized = false;
             let mut stream = std::pin::pin!(stream);
             while let Some(r) = stream.next().await {
                 match r.map_err(ChatError::from) {
                     Ok(c) => {
+                        // Bookkeeping runs before the chunk is forwarded, because the terminal
+                        // chunk can carry the very usage finalization is about to read. Both
+                        // accumulator rules keep the semantics they have always had; only their
+                        // position moved.
                         if let Some(ref m) = c.model {
                             if let Some(ref prev) = first_model {
                                 if prev != m {
@@ -518,14 +760,36 @@ pub async fn chat_completions(
                                 first_model = Some(m.clone());
                             }
                         }
-                        yield ChatStreamItem::Ok(c.data);
-                        // Accumulate the latest usage; actual emit happens after stream EOF
-                        // so providers that send usage in multiple chunks (e.g. Anthropic's
-                        // message_start + message_delta) produce exactly one log line and one
-                        // spend record.
+                        // Last reported usage wins, and a chunk that reports none leaves the
+                        // accumulator alone: providers that send usage in multiple chunks (e.g.
+                        // Anthropic's message_start + message_delta) still produce exactly one
+                        // log line and one spend record, and a terminal chunk carrying no usage
+                        // does not erase what an earlier chunk reported.
                         if let Some(ref usage) = c.usage {
                             last_seen_usage = Some(usage.clone());
                         }
+                        if c.is_final {
+                            // The adapter has declared this chunk the clean end of a completed
+                            // upstream response, so the request can be accounted now — before
+                            // any of it is forwarded. Everything from here to the first `yield`
+                            // is synchronous, so the request is accounted whether or not the
+                            // client ever reads another byte; a client that stops at the
+                            // provider's terminator, as the OpenAI SDKs do, is accounted all the
+                            // same.
+                            let model_used = first_model.as_deref().unwrap_or(&model);
+                            let usage_event = finalize_stream_accounting(
+                                &acct,
+                                last_seen_usage.as_ref(),
+                                model_used,
+                            );
+                            finalized = true;
+                            yield ChatStreamItem::Ok(c.data);
+                            yield ChatStreamItem::Ok(usage_event);
+                            // Nothing after a clean terminal chunk is part of the response, so
+                            // the provider stream is never polled again.
+                            break;
+                        }
+                        yield ChatStreamItem::Ok(c.data);
                     }
                     Err(e) => {
                         // Known limitation: we emit oxigate.error and do not emit oxigate.usage.
@@ -559,92 +823,32 @@ pub async fn chat_completions(
                 }
             }
 
-            // +: emit oxigate.usage SSE event, structured cost log, and spend
-            // write exactly once after stream EOF. Skipped on error-interrupted streams
-            // (stream_error = true) to avoid double-counting partial usage.
-            if !stream_error && let Some(ref usage) = last_seen_usage {
-                    let model_used = first_model.as_deref().unwrap_or(&model);
-                    let (headers, cost_breakdown, token_usage) = cost_headers::build_cost_headers(
-                        model_used,
-                        usage,
-                        pricing_db.clone(),
-                        batch,
-                    );
-                    let cost = headers
-                        .get(CostHeader::REQUEST_COST)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("0");
-                    let input = headers
-                        .get(CostHeader::INPUT_TOKENS)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("0");
-                    let output = headers
-                        .get(CostHeader::OUTPUT_TOKENS)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("0");
-                    let model_used_val = model_used.to_string();
-                    let event = format!(
-                        "event: oxigate.usage\ndata: {{\"{}\":\"{}\",\"{}\":\"{}\",\"{}\":\"{}\",\"{}\":\"{}\"}}\n\n",
-                        CostHeader::REQUEST_COST,
-                        cost,
-                        CostHeader::INPUT_TOKENS,
-                        input,
-                        CostHeader::OUTPUT_TOKENS,
-                        output,
-                        CostHeader::MODEL_USED,
-                        model_used_val,
-                    );
-                    yield ChatStreamItem::Ok(Bytes::from(event));
-
-                    let latency_ms = i32::try_from(request_start.elapsed().as_millis())
-                        .unwrap_or_else(|_| {
-                            tracing::warn!(
-                                "streaming request latency overflows i32; recording -1"
-                            );
-                            -1
-                        });
-                    let record = SpendRecord::build(
-                        &identity,
-                        &model_used_val,
-                        &provider_name,
-                        &token_usage,
-                        &cost_breakdown,
-                        latency_ms,
-                    );
-                    //: emit per-request cost counter (nano-USD).
-                    metrics::counter!(
-                        COST_USD_TOTAL,
-                        "provider" => provider_name.clone(),
-                        "endpoint" => ENDPOINT_CHAT
-                    )
-                    .increment(cost_breakdown.total_cost.as_u64());
-
-                    //: request size observability at DEBUG (stays local to chat path).
-                    tracing::debug!(
-                        request_id = %request_id,
-                        request_body_bytes = ?content_length,
-                        "chat_request_size"
-                    );
-                    crate::api::spawn_cost_log_and_spend(
-                        "chat_completion_cost",
-                        record,
-                        &request_id,
-                        cost,
-                        Arc::clone(&pool),
-                        Arc::clone(&redis),
-                        budget.clone(),
-                    );
-            }
-
-            // Clean provider EOF with no usage in any chunk — not a client disconnect: on disconnect
-            // Tokio cancels this future at the next suspension (e.g. stream.next().await), so control
-            // never reaches this post-loop block. Use this message for log routing, not as a disconnect signal.
-            if !stream_error && last_seen_usage.is_none() {
-                tracing::warn!(
-                    request_id = %request_id,
-                    model = %model,
-                    "stream_eof_no_usage"
+            // Clean end of stream with no chunk marked terminal. Adapters that mark their
+            // terminal chunk finalize above and set `finalized`, so this is the fallback for a
+            // stream that ended without one — a degraded termination the adapter would not
+            // certify as a clean completion, or an adapter that has not opted into the
+            // terminal-chunk contract. Such a request is still accounted, but only once the
+            // consumer polls past the last chunk.
+            //
+            // Skipped on error-interrupted streams (stream_error = true) to avoid
+            // double-counting partial usage: an interrupted stream is deliberately charged
+            // nothing.
+            if !stream_error && !finalized {
+                // Reaching here means no chunk of this stream was marked terminal, so its
+                // accounting depended on the consumer polling once more than the response
+                // required. That is the pre-contract behaviour and it is not an error, but it
+                // is worth being able to find: it is how a request silently loses its spend row
+                // when a client stops reading. Logged with the provider so the cause —
+                // a degraded termination, an adapter that has not adopted the contract, or an
+                // upstream that sent no terminator — can be told apart per lane.
+                tracing::debug!(
+                    provider = %acct.provider_name,
+                    "stream finalized at end of stream; no terminal chunk was marked"
                 );
+                let model_used = first_model.as_deref().unwrap_or(&model);
+                let usage_event =
+                    finalize_stream_accounting(&acct, last_seen_usage.as_ref(), model_used);
+                yield ChatStreamItem::Ok(usage_event);
             }
         };
         // Client disconnect propagation: when axum drops this Body (client disconnects),
@@ -698,12 +902,13 @@ pub async fn chat_completions(
         .cloned()
         .unwrap_or(provider_name);
 
-    let (cost_headers, cost_breakdown, token_usage) = cost_headers::build_cost_headers(
+    let (cost_headers, accounting) = cost_headers::build_cost_headers(
         &response.model,
         &response.usage,
         Arc::clone(&state.pricing_db),
         batch,
     );
+    cost_headers::report_finalized_warning(&request_id, &response.model, &accounting);
 
     let latency_ms = i32::try_from(request_start.elapsed().as_millis()).unwrap_or_else(|_| {
         tracing::warn!("request latency overflows i32; recording -1");
@@ -715,11 +920,10 @@ pub async fn chat_completions(
         &identity,
         &response.model,
         &provider_name,
-        &token_usage,
-        &cost_breakdown,
+        &accounting,
         latency_ms,
     );
-    let cost_usd = cost_breakdown.total_cost.to_display_string();
+    let cost_usd = accounting.cost.total_cost.to_display_string();
     let budget = state.budget_settings.read().await.clone();
     //: request size observability at DEBUG (stays local to chat path).
     tracing::debug!(
@@ -743,7 +947,7 @@ pub async fn chat_completions(
         "provider" => provider_name.clone(),
         "endpoint" => ENDPOINT_CHAT
     )
-    .increment(cost_breakdown.total_cost.as_u64());
+    .increment(accounting.cost.total_cost.as_u64());
 
     let expose_providers = state.security.read().await.expose_provider_names;
     let mut resp = (StatusCode::OK, cost_headers, Json(response)).into_response();

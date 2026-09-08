@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use bytes::Bytes;
 use futures::stream;
 
 use crate::config::{FallbackRule, FallbackTarget, PricingConfig, RoutingConfig};
@@ -76,12 +77,10 @@ fn test_adapter(name: &str, models: Vec<&str>) -> Arc<dyn ProviderAdapter> {
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
                     prompt_tokens_details: None,
-                    tier_threshold_override: None,
-                    cache_accounting: crate::domain::chat::CacheAccounting::Inclusive,
+                    accounting: crate::domain::chat::UsageAccounting::default(),
                     image_units: None,
                     audio_seconds: None,
-                    cache_creation_5m_tokens: 0,
-                    cache_creation_1h_tokens: 0,
+                    ..Default::default()
                 },
             })
         }
@@ -1215,7 +1214,7 @@ async fn test_best_matching_rule_provider_plus_model_wins() {
 // Bug regression tests (critical fixes)
 // -----------------------------------------------------------------------
 
-/// Bug 1 regression: `record_retry` must not be called on the last loop iteration
+/// Regression: `record_retry` must not be called on the last loop iteration
 /// (when no retry will actually follow). With max_retries=0 and a single retryable
 /// failure, zero retry metrics should be emitted (verified indirectly: the
 /// FetchAttempt count stays at 1 and is_retry=false).
@@ -1249,7 +1248,7 @@ async fn test_retry_metric_not_emitted_when_no_retry_follows() {
     );
 }
 
-/// Bug 2 regression: primary retries must not be misclassified as fallback attempts.
+/// Regression: primary retries must not be misclassified as fallback attempts.
 /// After max_retries=2 on the primary with no fallback rule configured, the trace
 /// must report 3 dispatched attempts (attempt 0 + 2 retries) and fallback_dispatched=false.
 #[tokio::test]
@@ -1287,7 +1286,7 @@ async fn test_primary_retries_not_misclassified_as_fallback() {
     );
 }
 
-/// Bug 3 regression: dedup in meta_from_trace must be by (provider, model), not just provider.
+/// Regression: dedup in meta_from_trace must be by (provider, model), not just provider.
 /// When primary retries with a different model override, both must appear in AttemptedMeta.
 /// Simulated by constructing a FallbackDecisionTrace directly.
 #[test]
@@ -1344,7 +1343,7 @@ fn test_meta_from_trace_dedup_by_provider_and_model() {
     );
 }
 
-/// Bug 3 regression (inverse): same (provider, model) pair repeated as retries
+/// Regression (inverse of the case above): same (provider, model) pair repeated as retries
 /// must be collapsed to one entry in AttemptedMeta.
 #[test]
 fn test_meta_from_trace_collapses_same_provider_model_retries() {
@@ -1530,12 +1529,10 @@ async fn test_fallback_only_wildcard_not_selected_for_primary_routing() {
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
                     prompt_tokens_details: None,
-                    tier_threshold_override: None,
-                    cache_accounting: crate::domain::chat::CacheAccounting::Inclusive,
+                    accounting: crate::domain::chat::UsageAccounting::default(),
                     image_units: None,
                     audio_seconds: None,
-                    cache_creation_5m_tokens: 0,
-                    cache_creation_1h_tokens: 0,
+                    ..Default::default()
                 },
             })
         }
@@ -1572,5 +1569,89 @@ async fn test_fallback_only_wildcard_not_selected_for_primary_routing() {
     assert!(
         matches!(err, ProviderError::Internal(_)),
         "FallbackOnly wildcard adapter must not be selected for primary routing; got: {err:?}"
+    );
+}
+
+/// A consumer that stops at the adapter's clean terminal chunk must still report the provider
+/// healthy — the health signal cannot be conditional on the consumer polling one more time.
+///
+/// `GuardedStream` fires `on_response` (HALF-OPEN → CLOSED, plus the latency sample), and the
+/// streaming retry loop deliberately delegates that call to it rather than making it itself. A
+/// terminal chunk ends the response, so a consumer that stops there never produces the
+/// end-of-stream poll: without the terminal-chunk branch the probe result is never recorded and
+/// the provider stays HALF-OPEN with its probe slot already taken, which no later request can
+/// clear.
+#[tokio::test]
+async fn test_terminal_chunk_reports_health_without_an_end_of_stream_poll() {
+    use crate::domain::ports::ProviderCandidate;
+    use crate::providers::router::streaming::GuardedStream;
+    use futures::StreamExt;
+
+    let provider = test_adapter("openai", vec!["gpt-4o"]);
+    let names = vec!["openai".to_string()];
+    // cooldown_secs = 0 so the Open state expires immediately and the next `candidates()`
+    // call performs the Open → HalfOpen transition and claims the probe slot.
+    let tracker = Arc::new(ProviderHealthTracker::new(&names, None, 0, 0.1));
+    tracker.on_rate_limit("openai").await;
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+    let probe: Vec<ProviderCandidate> = tracker
+        .candidates(
+            &[Arc::clone(&provider)],
+            &Default::default(),
+            "gpt-4o",
+            &make_pricing_db(),
+        )
+        .await;
+    assert!(
+        probe.iter().any(|c| !c.is_cooling_down),
+        "precondition: the first caller after cooldown expiry must be granted the probe slot"
+    );
+
+    // A response that ends the way a contract-honouring adapter ends one: a content chunk, then
+    // a chunk marked terminal. Nothing follows it, exactly as on the wire.
+    let mut terminal = StreamChunk::new(Bytes::from_static(b"data: [DONE]\n\n"), None, None);
+    terminal.is_final = true;
+    let inner: ChatCompletionStream = Box::pin(stream::iter(vec![
+        Ok(StreamChunk::new(
+            Bytes::from_static(b"data: {\"choices\":[]}\n\n"),
+            None,
+            None,
+        )),
+        Ok(terminal),
+    ]));
+
+    {
+        let mut guarded = GuardedStream {
+            inner,
+            _guard: crate::providers::health::InFlightGuard::new(&tracker, "openai"),
+            tracker: Arc::clone(&tracker),
+            provider_name: "openai".to_string(),
+            stream_start: std::time::Instant::now(),
+            reported: false,
+        };
+        // Consume exactly as `api/chat.rs` does: stop at the terminal chunk, never poll again.
+        let first = guarded.next().await;
+        assert!(matches!(first, Some(Ok(ref c)) if !c.is_final));
+        let second = guarded.next().await;
+        assert!(matches!(second, Some(Ok(ref c)) if c.is_final));
+    } // dropped without an end-of-stream poll
+
+    // on_response is spawned, so let it run.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let after: Vec<ProviderCandidate> = tracker
+        .candidates(
+            &[Arc::clone(&provider)],
+            &Default::default(),
+            "gpt-4o",
+            &make_pricing_db(),
+        )
+        .await;
+    assert!(
+        after.iter().any(|c| !c.is_cooling_down),
+        "a completed streaming probe must return the provider to CLOSED; it is still \
+         reported as cooling, so its probe slot is latched and no later request can clear it"
     );
 }

@@ -98,7 +98,7 @@ async fn streaming_client_disconnect_releases_upstream_before_slow_chunk() {
 
     let base = format!("http://{}", upstream_addr);
     let config = openai_config_upstream(&base);
-    let adapter = OpenAiAdapter::new(config)
+    let adapter = OpenAiAdapter::new(config, crate::common::bundled_pricing_holder())
         .await
         .expect("OpenAI adapter must build");
     let gateway =

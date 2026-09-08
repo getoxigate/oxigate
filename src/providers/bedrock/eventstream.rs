@@ -12,7 +12,7 @@ use bytes::BytesMut;
 
 use crate::domain::ports::ProviderError;
 
-use super::translate::bedrock_stop;
+use super::translate::{CacheDetail, bedrock_stop};
 
 // AWS EventStream frame header names (Binary Format spec, §3.1).
 mod header_name {
@@ -51,6 +51,13 @@ pub enum ConverseEvent {
     Metadata {
         input_tokens: u64,
         output_tokens: u64,
+        /// Tokens served from cache. Additive: not part of `input_tokens`.
+        cache_read_input_tokens: Option<u64>,
+        /// The provider's cache-write aggregate — an alternate view of `cache_details`, not an
+        /// addition to it.
+        cache_write_input_tokens: Option<u64>,
+        /// The per-class breakdown of the cache write. Empty when the frame carries none.
+        cache_details: Vec<CacheDetail>,
     },
     Ignored,
     StreamError(ProviderError),
@@ -149,9 +156,22 @@ fn dispatch_event(event_kind: Option<&str>, payload: &[u8]) -> ConverseEvent {
                 .pointer("/usage/outputTokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            let cache_read_input_tokens = json
+                .pointer("/usage/cacheReadInputTokens")
+                .and_then(|v| v.as_u64());
+            let cache_write_input_tokens = json
+                .pointer("/usage/cacheWriteInputTokens")
+                .and_then(|v| v.as_u64());
+            let cache_details = json
+                .pointer("/usage/cacheDetails")
+                .and_then(|v| serde_json::from_value::<Vec<CacheDetail>>(v.clone()).ok())
+                .unwrap_or_default();
             ConverseEvent::Metadata {
                 input_tokens: input,
                 output_tokens: output,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
+                cache_details,
             }
         }
         Some(event_type::INTERNAL_SERVER_EXCEPTION) | Some(event_type::MODEL_STREAM_ERROR) => {
@@ -265,10 +285,93 @@ mod tests {
         if let ConverseEvent::Metadata {
             input_tokens,
             output_tokens,
+            ref cache_read_input_tokens,
+            ref cache_write_input_tokens,
+            ref cache_details,
         } = events[0]
         {
             assert_eq!(input_tokens, 10);
             assert_eq!(output_tokens, 5);
+            assert_eq!(*cache_read_input_tokens, None);
+            assert_eq!(*cache_write_input_tokens, None);
+            assert!(cache_details.is_empty());
+        } else {
+            panic!("expected Metadata");
+        }
+    }
+
+    /// The metadata frame's cache fields reach `ConverseEvent::Metadata` unmodified — the
+    /// accounting these values feed (residual pricing, unknown classes, aggregate-vs-detail
+    /// reconciliation) is `converse_cache_write`'s own contract and is exercised there; this
+    /// test is only about whether the three wire fields survive the frame parse.
+    #[test]
+    fn test_eventstream_parses_metadata_cache_fields() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "usage": {
+                "inputTokens": 10_000,
+                "outputTokens": 500,
+                "totalTokens": 10_500,
+                "cacheReadInputTokens": 2_000,
+                "cacheWriteInputTokens": 1_500,
+                "cacheDetails": [
+                    {"ttl": "5m", "inputTokens": 1_000},
+                    {"ttl": "1h", "inputTokens": 500}
+                ]
+            }
+        }))
+        .unwrap();
+        let frame = build_frame(event_type::METADATA, &payload);
+        let mut parser = EventStreamParser::new();
+        let events = parser.feed(&frame).unwrap();
+        assert_eq!(events.len(), 1);
+        if let ConverseEvent::Metadata {
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens,
+            cache_write_input_tokens,
+            cache_details,
+        } = &events[0]
+        {
+            assert_eq!(*input_tokens, 10_000);
+            assert_eq!(*output_tokens, 500);
+            assert_eq!(*cache_read_input_tokens, Some(2_000));
+            assert_eq!(*cache_write_input_tokens, Some(1_500));
+            let ttls: Vec<&str> = cache_details.iter().map(|d| d.ttl.as_str()).collect();
+            assert_eq!(ttls, vec!["5m", "1h"]);
+            assert_eq!(cache_details[0].input_tokens, 1_000);
+            assert_eq!(cache_details[1].input_tokens, 500);
+        } else {
+            panic!("expected Metadata");
+        }
+    }
+
+    /// AWS documents `cacheDetails` as "Empty if no cache creation occurred" — a frame that
+    /// carries the key with an empty array must not be conflated with one that omits it
+    /// entirely. Both parse to an empty `Vec`, which is the correct shape either way; this test
+    /// pins that an explicit empty array does not error or get treated as malformed.
+    #[test]
+    fn test_eventstream_parses_metadata_with_empty_cache_details() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "cacheDetails": []
+            }
+        }))
+        .unwrap();
+        let frame = build_frame(event_type::METADATA, &payload);
+        let mut parser = EventStreamParser::new();
+        let events = parser.feed(&frame).unwrap();
+        assert_eq!(events.len(), 1);
+        if let ConverseEvent::Metadata {
+            cache_write_input_tokens,
+            cache_details,
+            ..
+        } = &events[0]
+        {
+            assert_eq!(*cache_write_input_tokens, None);
+            assert!(cache_details.is_empty());
         } else {
             panic!("expected Metadata");
         }
