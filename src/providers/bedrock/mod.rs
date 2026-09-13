@@ -25,7 +25,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tracing::{info, warn};
 
 use crate::config::BedrockConfig;
-use crate::domain::chat::{ChatRequest, ChatResponse, StreamChunk, Usage};
+use crate::domain::chat::{ChatRequest, ChatResponse, StreamChunk};
 use crate::domain::ports::{
     ChatCompletionStream, HealthStatus, ProviderAdapter, ProviderAdapterExt, ProviderError,
     ProviderKind, ProviderMetadata,
@@ -39,8 +39,8 @@ use crate::utils::sse::openai_chat_completion_envelope;
 use self::eventstream::{ConverseEvent, EventStreamParser};
 use self::signing::BedrockSigner;
 use self::translate::{
-    BEDROCK_ACCOUNTING, ConverseResponse, chat_request_to_converse, converse_cache_write,
-    converse_response_to_chat, map_stop_reason,
+    BEDROCK_ACCOUNTING, ConverseResponse, ConverseUsage, chat_request_to_converse,
+    converse_response_to_chat, converse_usage_to_usage, map_stop_reason,
 };
 
 const DEFAULT_MODEL: &str = "anthropic.claude-3-5-sonnet-20241022-v2:0";
@@ -503,23 +503,18 @@ impl ProviderAdapter for BedrockAdapter {
                             cache_write_input_tokens,
                             cache_details,
                         } => {
-                            let cache_write = converse_cache_write(
+                            let frame_usage = ConverseUsage {
+                                input_tokens,
+                                output_tokens,
+                                cache_read_input_tokens,
                                 cache_write_input_tokens,
-                                &cache_details,
+                                cache_details: Some(cache_details),
+                            };
+                            let usage = converse_usage_to_usage(
+                                Some(&frame_usage),
+                                BEDROCK_ACCOUNTING,
                                 &pricing_context,
                             );
-                            let usage = Usage {
-                                prompt_tokens: input_tokens,
-                                completion_tokens: output_tokens,
-                                // Deliberately excludes both cache buckets, matching the buffered
-                                // path and the sibling Additive lane.
-                                total_tokens: input_tokens + output_tokens,
-                                cache_creation_input_tokens: cache_write.published_tokens(),
-                                cache_read_input_tokens,
-                                accounting: BEDROCK_ACCOUNTING,
-                                cache_write,
-                                ..Default::default()
-                            };
                             // take() clears pending_stop_reason so the post-loop fallback
                             // doesn't double-emit [DONE].
                             let taken = pending_stop_reason.take();
@@ -619,6 +614,7 @@ impl ProviderAdapterExt for BedrockAdapter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::chat::Usage;
 
     fn test_pricing_holder() -> Arc<RwLock<PricingDb>> {
         Arc::new(RwLock::new(
@@ -790,5 +786,168 @@ mod tests {
         }
         let result = resolve_credentials(&config);
         assert!(matches!(result, Err(ProviderError::Auth(_))));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Buffered/streamed usage parity
+    // -----------------------------------------------------------------------------------------
+
+    /// One set of usage facts, stated once and reported both as a `Converse` response's `usage`
+    /// member and as a `ConverseStream` `metadata` frame's.
+    struct ParityCase {
+        name: &'static str,
+        /// The `usage` object both payloads carry, or `None` when both omit it.
+        usage: Option<&'static str>,
+    }
+
+    /// Every bucket this wire shape can report, plus the omissions it permits.
+    const PARITY_CASES: &[ParityCase] = &[
+        ParityCase {
+            name: "plain input and output only",
+            usage: Some(r#"{"inputTokens":1000,"outputTokens":200}"#),
+        },
+        ParityCase {
+            name: "cache read",
+            usage: Some(r#"{"inputTokens":1000,"outputTokens":200,"cacheReadInputTokens":400}"#),
+        },
+        ParityCase {
+            name: "cache write with per-class details",
+            usage: Some(
+                r#"{"inputTokens":1000,"outputTokens":200,"cacheWriteInputTokens":1500,"cacheDetails":[{"ttl":"5m","inputTokens":1000},{"ttl":"1h","inputTokens":500}]}"#,
+            ),
+        },
+        ParityCase {
+            name: "cache write aggregate with cacheDetails absent",
+            usage: Some(r#"{"inputTokens":1000,"outputTokens":200,"cacheWriteInputTokens":1500}"#),
+        },
+        ParityCase {
+            name: "cacheDetails present but empty",
+            usage: Some(
+                r#"{"inputTokens":1000,"outputTokens":200,"cacheWriteInputTokens":0,"cacheDetails":[]}"#,
+            ),
+        },
+        ParityCase {
+            name: "details falling short of the aggregate",
+            usage: Some(
+                r#"{"inputTokens":1000,"outputTokens":200,"cacheWriteInputTokens":1500,"cacheDetails":[{"ttl":"5m","inputTokens":1000}]}"#,
+            ),
+        },
+        ParityCase {
+            name: "a ttl that names no duration",
+            usage: Some(
+                r#"{"inputTokens":1000,"outputTokens":200,"cacheWriteInputTokens":1000,"cacheDetails":[{"ttl":"forever","inputTokens":1000}]}"#,
+            ),
+        },
+        ParityCase {
+            name: "every bucket at once",
+            usage: Some(
+                r#"{"inputTokens":1000,"outputTokens":200,"cacheReadInputTokens":400,"cacheWriteInputTokens":1500,"cacheDetails":[{"ttl":"5m","inputTokens":1000},{"ttl":"1h","inputTokens":500}]}"#,
+            ),
+        },
+        ParityCase {
+            name: "usage block absent",
+            usage: None,
+        },
+    ];
+
+    /// The bundled Bedrock entry, so both paths account against the production class registry.
+    const PARITY_MODEL: &str = "anthropic.claude-sonnet-4-6";
+
+    /// Runs one case through the adapter's real `Converse` and `ConverseStream` entry points
+    /// against a mocked upstream, returning the usage each path produced.
+    async fn buffered_and_streamed_usage(case: &ParityCase) -> (Usage, Usage) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mut buffered_body = serde_json::json!({
+            "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+            "stopReason": "end_turn",
+        });
+        let mut metadata = serde_json::json!({});
+        if let Some(usage) = case.usage {
+            let usage: serde_json::Value =
+                serde_json::from_str(usage).expect("case usage is valid JSON");
+            buffered_body["usage"] = usage.clone();
+            metadata["usage"] = usage;
+        }
+        let mut stream_body = Vec::new();
+        for (event, payload) in [
+            (
+                "contentBlockDelta",
+                serde_json::json!({"contentBlockIndex": 0, "delta": {"text": "hi"}}),
+            ),
+            ("messageStop", serde_json::json!({"stopReason": "end_turn"})),
+            ("metadata", metadata),
+        ] {
+            let payload = serde_json::to_vec(&payload).expect("frame payload serializes");
+            stream_body.extend_from_slice(&eventstream::build_frame(event, &payload));
+        }
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/model/{PARITY_MODEL}/converse")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(buffered_body))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/model/{PARITY_MODEL}/converse-stream")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(stream_body)
+                    .append_header("content-type", "application/vnd.amazon.eventstream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut config = make_config("us-east-1");
+        config.access_key_id = Some(crate::config::SecretString::new("key"));
+        config.secret_access_key = Some(crate::config::SecretString::new("secret"));
+        config.endpoint_url = Some(mock.uri());
+        let adapter = BedrockAdapter::new(config, test_pricing_holder())
+            .await
+            .expect("adapter builds");
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": PARITY_MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid request");
+
+        let buffered = adapter
+            .chat_completion(&req)
+            .await
+            .expect("the buffered path succeeds")
+            .usage;
+
+        let mut stream = adapter
+            .chat_completion_stream(&req)
+            .await
+            .expect("the stream opens");
+        let mut streamed = None;
+        while let Some(chunk) = stream.next().await {
+            if let Some(usage) = chunk.expect("stream chunk").usage {
+                assert!(streamed.is_none(), "{}: one usage-bearing chunk", case.name);
+                streamed = Some(usage);
+            }
+        }
+
+        (
+            buffered,
+            streamed.expect("the metadata frame carries usage"),
+        )
+    }
+
+    /// The same facts reported by a `Converse` response and by a `ConverseStream` metadata frame
+    /// project into the same `Usage` on every field.
+    ///
+    /// Driven through the adapter's two production entry points rather than the translation
+    /// functions, so the streamed value is the one the stream actually emits.
+    #[tokio::test]
+    async fn test_converse_and_converse_stream_project_identical_usage() {
+        use crate::providers::usage_parity::assert_usage_parity;
+
+        for case in PARITY_CASES {
+            let (buffered, streamed) = buffered_and_streamed_usage(case).await;
+            assert_usage_parity(&buffered, &streamed, case.name);
+        }
     }
 }

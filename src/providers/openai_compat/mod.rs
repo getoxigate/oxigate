@@ -1231,7 +1231,7 @@ mod tests {
             Some(1_000),
             "the upstream's own field is passed through to the client"
         );
-        fixture::assert_unaccounted_and_unbilled(&resp.usage);
+        fixture::assert_unaccounted_and_unbilled(&resp.usage, COMPAT_DEFAULT_ACCOUNTING);
     }
 
     /// The same on the streamed path, which shares `make_compat_sse_stream` with Azure.
@@ -1278,6 +1278,95 @@ mod tests {
 
         fixture::assert_unaccounted_and_unbilled(
             &last_usage.expect("the terminal chunk carries usage"),
+            COMPAT_DEFAULT_ACCOUNTING,
+        );
+    }
+
+    /// The raw-forward buffered entry point normalizes exactly as `chat_completion` does.
+    ///
+    /// The router takes this path, not `chat_completion`, whenever it holds the inbound bytes,
+    /// so a normalization reached only from `chat_completion` would be bypassed in production
+    /// while every test of the translated path stayed green.
+    #[tokio::test]
+    async fn a_compat_raw_forward_normalizes_its_usage() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(crate::api::CHAT_COMPLETIONS_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": fixture::MODEL,
+                    "choices": [],
+                    "usage": fixture::usage_json(),
+                })),
+            )
+            .mount(&mock)
+            .await;
+
+        let adapter = OpenAICompatAdapter::new(compat_config_for(&mock.uri()), make_http())
+            .await
+            .expect("adapter must build");
+        let req = cache_write_request();
+        let raw = bytes::Bytes::from(serde_json::to_vec(&req).expect("request serializes"));
+        let resp = adapter
+            .try_forward_raw(&req, &raw)
+            .await
+            .expect("compat forwards raw")
+            .expect("chat must succeed");
+
+        fixture::assert_unaccounted_and_unbilled(&resp.usage, COMPAT_DEFAULT_ACCOUNTING);
+    }
+
+    /// The raw-forward streaming entry point normalizes exactly as `chat_completion_stream` does.
+    #[tokio::test]
+    async fn a_compat_raw_forward_stream_normalizes_its_usage() {
+        let mock = wiremock::MockServer::start().await;
+        let sse = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": fixture::MODEL,
+                "choices": [],
+                "usage": fixture::usage_json(),
+            })
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(crate::api::CHAT_COMPLETIONS_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(sse, "text/event-stream")
+                    .insert_header("Content-Type", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // `compat_config_for` leaves `stream_options_support` off, which is what makes the raw
+        // streaming path eligible at all.
+        let adapter = OpenAICompatAdapter::new(compat_config_for(&mock.uri()), make_http())
+            .await
+            .expect("adapter must build");
+        let mut req = cache_write_request();
+        req.stream = Some(true);
+        let raw = bytes::Bytes::from(serde_json::to_vec(&req).expect("request serializes"));
+        let mut stream = adapter
+            .try_forward_raw_stream(&req, &raw)
+            .await
+            .expect("compat forwards a raw stream")
+            .expect("stream must open");
+
+        let mut last_usage: Option<Usage> = None;
+        while let Some(chunk) = stream.next().await {
+            if let Some(u) = chunk.expect("no stream error").usage {
+                last_usage = Some(u);
+            }
+        }
+
+        fixture::assert_unaccounted_and_unbilled(
+            &last_usage.expect("the terminal chunk carries usage"),
+            COMPAT_DEFAULT_ACCOUNTING,
         );
     }
 

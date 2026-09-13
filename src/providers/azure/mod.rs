@@ -655,7 +655,7 @@ mod tests {
             .await
             .expect("chat must succeed");
 
-        fixture::assert_accounted_and_billed(&resp.usage);
+        fixture::assert_accounted_and_billed(&resp.usage, AZURE_ACCOUNTING);
     }
 
     /// The streamed path bills identically, through `make_compat_sse_stream`.
@@ -699,6 +699,7 @@ mod tests {
 
         fixture::assert_accounted_and_billed(
             &last_usage.expect("the terminal chunk carries usage"),
+            AZURE_ACCOUNTING,
         );
     }
 }

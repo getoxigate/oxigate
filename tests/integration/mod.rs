@@ -4,6 +4,7 @@
 //!
 //! Each submodule contains tests for a specific area (db_migrations, redis_pool, etc.).
 
+mod accounting_contract;
 mod auth;
 mod bedrock_cache_e2e;
 mod budget_e2e;

@@ -288,4 +288,37 @@ impl TestGateway {
         let server = axum_test::TestServer::new(app_router).expect("TestServer must build");
         Self { server }
     }
+
+    /// Spawns the gateway pricing from `pricing_db` instead of the bundled catalogue, with an
+    /// optional per-identity budget. Auth is bypassed (key: None).
+    ///
+    /// Pass the same holder the provider adapter was built with. An adapter that pins a pricing
+    /// generation per request snapshots it from its own holder, while the gateway prices any
+    /// request that carries no snapshot from this one — so a synthetic catalogue has to be
+    /// installed in both, or a lane could silently price against the bundled entries.
+    pub async fn spawn_with_pricing(
+        pool: DbPool,
+        redis: RedisPool,
+        provider: Arc<dyn ProviderAdapterExt>,
+        pricing_db: Arc<std::sync::RwLock<PricingDb>>,
+        budget: Option<BudgetConfig>,
+    ) -> Self {
+        let mut app_state = test_app_state(
+            pool,
+            redis,
+            provider,
+            AuthConfig::default(),
+            ProviderHealthTracker::new_for_test(&[]),
+        );
+        app_state.pricing_db = pricing_db;
+        if let Some(budget) = budget {
+            app_state.budget_settings = Arc::new(tokio::sync::RwLock::new(budget.clone()));
+            app_state.budget = Arc::new(tokio::sync::RwLock::new(
+                BudgetRuntimeConfig::from_budget_config(budget),
+            ));
+        }
+        let app_router = router(app_state);
+        let server = axum_test::TestServer::new(app_router).expect("TestServer must build");
+        Self { server }
+    }
 }

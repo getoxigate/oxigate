@@ -94,6 +94,45 @@ because every contract using it emits the same SSE shape. The Azure adapter pass
 declaration; a generic compat instance passes its own. Streaming and non-streaming Azure requests
 are therefore billed under the same semantics.
 
+### Usage-field audit
+
+Every member of the usage object Azure documents for the two API versions this adapter's accounting
+is established for (see [API version compatibility](#api-version-compatibility)), and what the
+gateway does with it.
+
+- **Audited object:** `completionUsage` — the `usage` of the chat-completions response.
+- **Sources**, under `Azure/azure-rest-api-specs`,
+  `specification/cognitiveservices/data-plane/AzureOpenAI/inference/`:
+  - `2024-10-21`: `stable/2024-10-21/inference.json` @ `69fd7074df3358b7e2880a354c540f036fc4d863`
+  - `2025-02-01-preview`: `preview/2025-02-01-preview/inference.json` @
+    `69b282ce9cd7640b2188a9ce50969e3a765f4f71`
+  - Guide: Microsoft's prompt-caching guide,
+    `https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/prompt-caching` (page "Last
+    updated" 2026-08-11), for the members it shows in its example response.
+- Accessed 2026-09-11.
+
+The specs lag the service. `2024-10-21` declares no `prompt_tokens_details` at all, and
+`2025-02-01-preview` declares `cached_tokens` but not `cache_write_tokens`; the guide documents
+Standard GPT-5.6+ deployments reporting both, which is why it has a column. Neither spec version
+declares `usage` on the streamed chunk: the adapter requests it with `stream_options.include_usage`
+and reads the same object from the final chunk.
+
+**Not read** means the member plays no part in cost, cost status, the spend row or the budget
+counter.
+
+| Member | `2024-10-21` | `2025-02-01-preview` | Guide | Gateway use |
+|---|---|---|---|---|
+| `prompt_tokens` | ✓ | ✓ | ✓ | `prompt_tokens`. Charged at the input rate after the cached and cache-write subsets are carved out |
+| `completion_tokens` | ✓ | ✓ | ✓ | `completion_tokens`. Charged at the output rate after the reasoning subset is carved out |
+| `total_tokens` | ✓ | ✓ | ✓ | `total_tokens`. Reported, not priced |
+| `prompt_tokens_details.cached_tokens` | — | ✓ | ✓ | `cache_read_input_tokens`. Charged at the tier's `cache_read_multiplier` |
+| `prompt_tokens_details.cache_write_tokens` | — | — | ✓ | A `30m` cache write, republished on `cache_creation_input_tokens` (see [Cache writes](#cache-writes)) |
+| `prompt_tokens_details.audio_tokens` | — | ✓ | ✓ | Not read. Audio input stays inside `prompt_tokens` at the text input rate; the pricing schema has no audio-token rate |
+| `completion_tokens_details.reasoning_tokens` | ✓ | ✓ | ✓ | `completion_tokens_details.reasoning_tokens`. Charged once at the thinking rate |
+| `completion_tokens_details.audio_tokens` | — | ✓ | ✓ | Not read. Audio output stays inside `completion_tokens` at the text output rate |
+| `completion_tokens_details.accepted_prediction_tokens` | — | ✓ | — | Not read. Part of the completion, already charged inside `completion_tokens` |
+| `completion_tokens_details.rejected_prediction_tokens` | — | ✓ | — | Not read. The spec states these are "still counted in the total completion tokens for purposes of billing" |
+
 ---
 
 ## URL construction
@@ -125,6 +164,10 @@ that include both headers simultaneously.
 - `"2024-10-21"` is the minimum tested GA version. OxiGate forwards `api_version` verbatim to
   Azure, so newer preview versions (e.g. `"2025-02-01-preview"`) work if your deployment supports them.
   Operators migrating from LiteLLM may be on `"2025-02-01-preview"` — both work.
+- **Accounting completeness is established only for `"2024-10-21"` and `"2025-02-01-preview"`**,
+  together with the members Microsoft's prompt-caching guide documents for those responses — see
+  [Usage-field audit](#usage-field-audit). Any other `api_version` is still forwarded unchanged,
+  but a usage member it adds has not been audited and may not be billed.
 - `response_format` (JSON mode / structured outputs) requires `api_version >= "2024-08-*"`. Older
   deployments will receive a 400 from Azure. OxiGate forwards the field as-is without
   version-gating; omit `response_format` for deployments on older API versions.

@@ -1431,6 +1431,107 @@ mod tests {
         );
     }
 
+    /// Reads one `kind` of the invariant-violation counter out of a Prometheus rendering; a
+    /// series never incremented is absent from it, which reads as zero.
+    fn invariant_violations(rendered: &str, kind: &str) -> u64 {
+        let series = format!(
+            "{}{{kind=\"{kind}\"}} ",
+            metrics::USAGE_INVARIANT_VIOLATION_TOTAL
+        );
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&series))
+            .map_or(0, |count| {
+                count.parse().expect("a counter renders as an integer")
+            })
+    }
+
+    /// Finalizing one payload moves the invariant-violation counter by exactly the contradictions
+    /// that payload carries: one for a cache-inclusive prompt smaller than its cache, one for a
+    /// completion smaller than the reasoning it contains, and none for a normal Anthropic request,
+    /// whose disjoint cache buckets dwarf its prompt.
+    ///
+    /// Counted under a local recorder: the metric's only label is `kind`, so a delta on the
+    /// process-global recorder would race every concurrent test that finalizes a request. No price
+    /// is asserted, and the counter moves before pricing.
+    #[test]
+    fn test_invariant_violation_metric_counts_each_contradiction_once() {
+        let cache_exceeds_prompt = Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 100,
+            total_tokens: 1_100,
+            cache_read_input_tokens: Some(5_000),
+            accounting: UsageAccounting {
+                cache: CacheAccounting::Inclusive,
+                reasoning: ReasoningAccounting::Additive,
+            },
+            ..Default::default()
+        };
+        let reasoning_exceeds_completion = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 500,
+            total_tokens: 600,
+            completion_tokens_details: Some(crate::domain::chat::CompletionTokensDetails {
+                reasoning_tokens: Some(900),
+            }),
+            accounting: UsageAccounting {
+                cache: CacheAccounting::Inclusive,
+                reasoning: ReasoningAccounting::IncludedInOutput,
+            },
+            ..Default::default()
+        };
+        let normal_anthropic = Usage {
+            prompt_tokens: 5_000,
+            completion_tokens: 500,
+            total_tokens: 5_500,
+            cache_read_input_tokens: Some(100_000),
+            cache_write: cache_write_of(&[("5m", 10_000), ("1h", 10_000)]),
+            completion_tokens_details: Some(crate::domain::chat::CompletionTokensDetails {
+                reasoning_tokens: Some(300),
+            }),
+            accounting: UsageAccounting {
+                cache: CacheAccounting::Additive,
+                reasoning: ReasoningAccounting::IncludedInOutput,
+            },
+            ..Default::default()
+        };
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let counts = || {
+            let rendered = handle.render();
+            (
+                invariant_violations(&rendered, metrics::INVARIANT_CACHE_EXCEEDS_PROMPT),
+                invariant_violations(&rendered, metrics::INVARIANT_REASONING_EXCEEDS_COMPLETION),
+            )
+        };
+        let finalize = |usage: &Usage| {
+            ::metrics::with_local_recorder(&recorder, || {
+                let _ = build_cost_headers("gpt-4.1", usage, holder(), false);
+            });
+        };
+
+        assert_eq!(counts(), (0, 0), "a fresh recorder has counted nothing");
+        finalize(&cache_exceeds_prompt);
+        assert_eq!(
+            counts(),
+            (1, 0),
+            "cache above an inclusive prompt counts once"
+        );
+        finalize(&reasoning_exceeds_completion);
+        assert_eq!(
+            counts(),
+            (1, 1),
+            "reasoning above its containing completion counts once"
+        );
+        finalize(&normal_anthropic);
+        assert_eq!(
+            counts(),
+            (1, 1),
+            "an additive request's large cache buckets are not a violation"
+        );
+    }
+
     /// The default accounting leaves the standard output charge equal to the reported completion
     /// total, so introducing the reasoning axis moves no billed amount on its own.
     #[test]

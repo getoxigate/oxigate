@@ -31,11 +31,11 @@ use crate::providers::tool_limits::{BEDROCK_MAX_TOOLS, TOOL_ARGS_MAX_BYTES};
 /// gives `total input tokens = inputTokens + cacheReadInputTokens + cacheWriteInputTokens`
 /// (accessed 2026-08-10).
 ///
-/// This is the one declaration in the family that differs from what the gateway assumed. Both
-/// Converse construction sites previously inherited the cache-inclusive type default, which is
-/// wrong for this contract. It bills identically today only because neither site parses
-/// `cacheReadInputTokens`, so there is nothing for an inclusive reading to subtract — the
-/// declaration is corrected here, before the parsing that would make it live money.
+/// This is the one declaration in the family that differs from the cache-inclusive type default,
+/// and it moves money: both Converse paths project through `converse_usage_to_usage`, which maps
+/// `cacheReadInputTokens` and the cache writes. An inclusive reading would carve those buckets out
+/// of an `inputTokens` that never contained them, undercharging the plain input — clamped at zero,
+/// with the overlap flagged, once they exceed it.
 ///
 /// Reasoning is `Additive`, the neutral value: neither Converse path parses a reasoning token
 /// count, so nothing is charged on that axis and no first-party reference has been captured for
@@ -480,26 +480,6 @@ pub fn converse_response_to_chat(
         .map(map_stop_reason)
         .map(String::from);
 
-    let usage = resp.usage.as_ref();
-    let (prompt_tokens, completion_tokens, total_tokens) = usage
-        .map(|u| {
-            (
-                u.input_tokens,
-                u.output_tokens,
-                // Deliberately excludes both cache buckets, matching the sibling Additive lane.
-                u.input_tokens + u.output_tokens,
-            )
-        })
-        .unwrap_or((0, 0, 0));
-
-    let cache_write = converse_cache_write(
-        usage.and_then(|u| u.cache_write_input_tokens),
-        usage
-            .and_then(|u| u.cache_details.as_deref())
-            .unwrap_or_default(),
-        pricing_context,
-    );
-
     ChatResponse {
         id: format!("chatcmpl-{}", request_id),
         object: "chat.completion".to_string(),
@@ -515,16 +495,41 @@ pub fn converse_response_to_chat(
             },
             finish_reason,
         }],
-        usage: Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            cache_creation_input_tokens: cache_write.published_tokens(),
-            cache_read_input_tokens: usage.and_then(|u| u.cache_read_input_tokens),
-            accounting: BEDROCK_ACCOUNTING,
-            cache_write,
-            ..Default::default()
-        },
+        usage: converse_usage_to_usage(resp.usage.as_ref(), BEDROCK_ACCOUNTING, pricing_context),
+    }
+}
+
+/// The single projection for the Converse wire shape, buffered and streamed.
+///
+/// `usage` is `None` only on the buffered path, where the response may omit the block entirely;
+/// that case yields zero counts and an empty cache-write accounting. The streaming path always
+/// has a metadata frame's fields to project, and builds a `ConverseUsage` from them.
+///
+/// `accounting` is the caller's contract declaration, supplied rather than read here, so the
+/// projection never infers the contract from the payload.
+pub(crate) fn converse_usage_to_usage(
+    usage: Option<&ConverseUsage>,
+    accounting: UsageAccounting,
+    pricing_context: &PricingContext,
+) -> Usage {
+    let (input_tokens, output_tokens) = usage.map_or((0, 0), |u| (u.input_tokens, u.output_tokens));
+    let cache_write = converse_cache_write(
+        usage.and_then(|u| u.cache_write_input_tokens),
+        usage
+            .and_then(|u| u.cache_details.as_deref())
+            .unwrap_or_default(),
+        pricing_context,
+    );
+    Usage {
+        prompt_tokens: input_tokens,
+        completion_tokens: output_tokens,
+        // Deliberately excludes both cache buckets, matching the sibling Additive lane.
+        total_tokens: input_tokens + output_tokens,
+        cache_creation_input_tokens: cache_write.published_tokens(),
+        cache_read_input_tokens: usage.and_then(|u| u.cache_read_input_tokens),
+        accounting,
+        cache_write,
+        ..Default::default()
     }
 }
 
@@ -546,7 +551,7 @@ pub fn converse_response_to_chat(
 /// statement that no exact rate was established.
 ///
 /// A `ttl` that does not canonicalize is one unknown class, never guessed at.
-pub(crate) fn converse_cache_write(
+fn converse_cache_write(
     reported_aggregate: Option<u64>,
     details: &[CacheDetail],
     pricing_context: &PricingContext,
@@ -703,10 +708,10 @@ mod tests {
         }
     }
 
-    /// The Converse contract's accounting reaches the non-stream construction site.
+    /// The Converse contract's accounting reaches the buffered response.
     ///
-    /// The streaming site in `bedrock/mod.rs` applies the same constant; the two are checked
-    /// separately because they are separate literals until they are collapsed.
+    /// The streaming path passes the same constant into the same projection; the adapter's
+    /// parity test holds its `accounting` equal to this one.
     #[test]
     fn test_converse_response_declares_bedrock_accounting() {
         let converse_resp = converse_response(5_000, 500);
@@ -795,13 +800,27 @@ mod tests {
     fn finalize_with_headers(
         usage: ConverseUsage,
     ) -> (Usage, axum::http::header::HeaderMap, FinalizedAccounting) {
+        finalize_priced(usage, PRICED_MODEL, bundled_pricing_holder())
+    }
+
+    /// The same finalization against a caller-chosen model and pricing holder, projecting and
+    /// pricing from one generation of that holder.
+    fn finalize_priced(
+        usage: ConverseUsage,
+        model: &str,
+        holder: std::sync::Arc<std::sync::RwLock<PricingDb>>,
+    ) -> (Usage, axum::http::header::HeaderMap, FinalizedAccounting) {
+        use crate::domain::pricing::snapshot_pricing_context;
         use crate::utils::cost_headers::build_cost_headers;
 
         let resp = converse_response_with_usage(usage);
-        let chat =
-            converse_response_to_chat(&resp, PRICED_MODEL, "req-cache", &test_pricing_context());
-        let (headers, finalized) =
-            build_cost_headers(PRICED_MODEL, &chat.usage, bundled_pricing_holder(), false);
+        let chat = converse_response_to_chat(
+            &resp,
+            model,
+            "req-cache",
+            &snapshot_pricing_context(&holder),
+        );
+        let (headers, finalized) = build_cost_headers(model, &chat.usage, holder, false);
         (chat.usage, headers, finalized)
     }
 
@@ -1108,6 +1127,184 @@ mod tests {
                 .get(CostHeader::COST_STATUS)
                 .and_then(|v| v.to_str().ok()),
             Some("exact")
+        );
+    }
+
+    /// Every downstream surface of one fully-populated Converse response, pinned to absolute
+    /// values.
+    ///
+    /// The projection this shape shares between `Converse` and `ConverseStream` sits upstream of
+    /// all of these, so an arithmetic or mapping change inside it moves at least one number here.
+    /// The streaming path is held equal to the buffered one by the adapter's parity test. Values are
+    /// asserted against the synthetic fixture's fixed rates rather than against each other, so
+    /// surfaces that agree on a wrong figure cannot satisfy it, and a catalogue price refresh
+    /// cannot move them.
+    ///
+    /// **Two legs are deliberately not claimed:** the terminal `oxigate.usage` SSE event and the
+    /// budget increment are emitted by the request handler, which nothing in this module can
+    /// drive.
+    #[test]
+    fn test_every_accounted_surface_of_a_full_converse_response_is_pinned() {
+        use crate::domain::auth::RequestIdentity;
+        use crate::domain::ports::NanoUsd;
+        use crate::domain::spend::SpendRecord;
+        use crate::domain::usage_accounting::{DuplicateAmbiguity, ReconciliationOutcome};
+        use crate::providers::usage_parity::{SYNTHETIC_MODEL, synthetic_pricing_holder};
+        use crate::utils::cost_headers::CostHeader;
+
+        // The classes this fixture states, named once; they mirror the payload's `ttl` values.
+        const STATED: [(&str, u64); 2] = [("5m", 1_000), ("1h", 500)];
+        let (usage, headers, finalized) = finalize_priced(
+            ConverseUsage {
+                input_tokens: 10_000,
+                output_tokens: 500,
+                cache_read_input_tokens: Some(2_000),
+                cache_write_input_tokens: Some(1_500),
+                cache_details: Some(STATED.iter().map(|&(ttl, n)| detail(ttl, n)).collect()),
+            },
+            SYNTHETIC_MODEL,
+            synthetic_pricing_holder(),
+        );
+
+        // --- Usage, every field ---
+        assert_eq!(usage.prompt_tokens, 10_000);
+        assert_eq!(usage.completion_tokens, 500);
+        assert_eq!(usage.total_tokens, 10_500);
+        assert!(usage.completion_tokens_details.is_none());
+        assert_eq!(usage.cache_creation_input_tokens, Some(1_500));
+        assert_eq!(usage.cache_read_input_tokens, Some(2_000));
+        assert!(usage.prompt_tokens_details.is_none());
+        assert_eq!(usage.accounting, BEDROCK_ACCOUNTING);
+        assert!(usage.image_units.is_none());
+        assert!(usage.audio_seconds.is_none());
+        for (class, tokens) in STATED {
+            assert_eq!(class_tokens(&usage, class), tokens);
+        }
+        assert_eq!(usage.cache_write.accounted_tokens(), 1_500);
+        assert_eq!(usage.cache_write.reported_tokens(), Some(1_500));
+        assert_eq!(usage.cache_write.detail_tokens(), 1_500);
+        assert_eq!(usage.cache_write.unknown_tokens(), 0);
+        assert_eq!(usage.cache_write.unmatched_residual_tokens(), 0);
+        assert_eq!(usage.cache_write.fallback_tokens(), 0);
+        assert!(!usage.cache_write.quantity_overflow());
+        assert!(usage.cache_write.partition_is_exact());
+        // One detail observation per stated class; the aggregate restates the same quantity and
+        // is not itself an observation.
+        assert_eq!(usage.cache_write.observation_count(), 2);
+        assert_eq!(usage.cache_write.published_tokens(), Some(1_500));
+        assert_eq!(
+            usage.cache_write.duplicate(),
+            DuplicateAmbiguity {
+                configured_duplicate: false,
+                unknown_indeterminate: false,
+            }
+        );
+        assert_eq!(
+            usage.cache_write.outcome(),
+            ReconciliationOutcome::Consistent
+        );
+        assert!(!usage.cache_write.evidence_truncated());
+        // The projection attaches the generation the request was dispatched under; what it
+        // guarantees is that this generation prices the classes the response reported.
+        let attached = usage
+            .cache_write
+            .pricing_context()
+            .expect("the projection attaches the request's pricing generation");
+        for (class, _) in STATED {
+            let canonical = CacheWriteClass::canonicalize(class)
+                .expect("the fixture states canonical durations");
+            assert!(
+                attached.registry().slot_of(&canonical).is_some(),
+                "the attached generation must price the reported class {class}"
+            );
+        }
+        let tier_rates = {
+            let inner = attached.db().read();
+            let entry = inner
+                .lookup(SYNTHETIC_MODEL, None)
+                .expect("the pinned model is in the synthetic fixture");
+            let tier = entry.get_tier(13_500);
+            (
+                tier.input_per_token,
+                tier.output_per_token,
+                tier.cache_read_multiplier,
+            )
+        };
+        assert_eq!(tier_rates, (2e-06, 1e-05, Some(0.5)));
+
+        // --- TokenUsage, every field ---
+        let tu = &finalized.token_usage;
+        assert_eq!(tu.input_tokens, 10_000);
+        assert_eq!(tu.output_tokens, 500);
+        assert_eq!(tu.standard_output_tokens(), 500);
+        assert_eq!(tu.cache_read_input_tokens, 2_000);
+        assert_eq!(tu.cache_write.accounted_tokens(), 1_500);
+        assert_eq!(tu.thinking_tokens, 0);
+        assert_eq!(tu.image_count, 0);
+        assert_eq!(tu.audio_seconds, 0.0);
+        assert!(!tu.batch);
+        assert_eq!(tu.reasoning_accounting, ReasoningAccounting::Additive);
+        // Additive: the tier comparator adds both cache buckets to the non-cached input.
+        assert_eq!(tu.context_input_tokens(), 13_500);
+
+        // --- Cost, every component, at the synthetic fixture's rates ---
+        // input 10_000 x 2_000 nano-USD = 20_000_000; cache read 2_000 x 2_000 x 0.5 =
+        // 2_000_000; writes 1_000 x 2_000 x 1.5 + 500 x 2_000 x 3.0 = 6_000_000; output
+        // 500 x 10_000 = 5_000_000; total 33_000_000.
+        let cost = &finalized.cost;
+        assert_eq!(cost.input_cost, NanoUsd(20_000_000));
+        assert_eq!(cost.cached_input_cost, NanoUsd(2_000_000));
+        assert_eq!(cost.cache_write_cost, NanoUsd(6_000_000));
+        assert_eq!(cost.output_cost, NanoUsd(5_000_000));
+        assert_eq!(cost.thinking_cost, NanoUsd(0));
+        assert_eq!(cost.image_cost, NanoUsd(0));
+        assert_eq!(cost.audio_cost, NanoUsd(0));
+        assert_eq!(cost.total_cost, NanoUsd(33_000_000));
+        assert_eq!(cost.status, CostStatus::Exact);
+
+        // --- The emitted headers ---
+        assert_eq!(
+            headers
+                .get(CostHeader::REQUEST_COST)
+                .and_then(|v| v.to_str().ok()),
+            Some(cost.total_cost.to_display_string()).as_deref()
+        );
+        assert_eq!(
+            headers
+                .get(CostHeader::COST_STATUS)
+                .and_then(|v| v.to_str().ok()),
+            Some("exact")
+        );
+
+        // --- The persisted row, every column, and the bounded evidence document verbatim ---
+        let record = SpendRecord::build(
+            &RequestIdentity::default(),
+            SYNTHETIC_MODEL,
+            "bedrock",
+            &finalized,
+            7,
+        );
+        assert_eq!(record.org_id, "default");
+        assert_eq!(record.identity_id, "default");
+        assert_eq!(record.tags, serde_json::json!({}));
+        assert_eq!(record.model, SYNTHETIC_MODEL);
+        assert_eq!(record.provider, "bedrock");
+        assert_eq!(record.prompt_tokens, 10_000);
+        assert_eq!(record.completion_tokens, 500);
+        assert_eq!(record.cache_read_tokens, 2_000);
+        assert_eq!(record.thinking_tokens, 0);
+        assert_eq!(record.cost_nano_usd, NanoUsd(33_000_000));
+        assert_eq!(record.cost_status, CostStatus::Exact);
+        assert_eq!(record.latency_ms, 7);
+        assert_eq!(
+            serde_json::to_string(
+                record
+                    .usage_evidence
+                    .as_ref()
+                    .expect("an accounted cache write persists its evidence")
+            )
+            .expect("the evidence document serializes"),
+            r#"{"schema_version":1,"cache_write":{"reported_tokens":1500,"detail_tokens":1500,"accounted_tokens":1500,"component_cost_nano_usd":6000000,"reconciliation":"consistent","unknown_duplicates_indeterminate":false,"quantity_overflow":false,"entries":[{"raw_key":"5m","canonical_class":"5m","tokens":1000},{"raw_key":"1h","canonical_class":"1h","tokens":500}],"incomplete":false}}"#
         );
     }
 

@@ -6,6 +6,8 @@ use std::{
     process::{Command, ExitStatus},
 };
 
+mod usage_scan;
+
 fn main() -> Result<()> {
     let task = env::args().nth(1);
     match task.as_deref() {
@@ -15,9 +17,10 @@ fn main() -> Result<()> {
         Some("doc") => doc(),
         Some("bench") => bench(),
         Some("sqlx-prepare") => sqlx_prepare(),
+        Some("usage-scan") => usage_scan::run(),
         Some(unknown) => bail!("unknown xtask: `{unknown}`"),
         None => {
-            eprintln!("Usage: cargo xtask <check|ci|audit|doc|bench|sqlx-prepare>");
+            eprintln!("Usage: cargo xtask <check|ci|audit|doc|bench|sqlx-prepare|usage-scan>");
             std::process::exit(1);
         }
     }
@@ -27,8 +30,14 @@ fn main() -> Result<()> {
 // Subcommands
 // ---------------------------------------------------------------------------
 
-/// Local pre-commit gate: fmt → clippy → test. Exits on first failure.
+/// Local pre-commit gate: provider usage scan → fmt → clippy → test. Exits on first failure.
 fn check() -> Result<()> {
+    // First: it parses source and runs no toolchain, so it costs well under a second.
+    usage_scan::run()?;
+    // The scan's own fixtures. The test runs below cover only the root package, and a scanner
+    // whose tests never run can start passing vacuously without anyone noticing. Run as its own
+    // invocation so the xtask's parser features do not unify into the library's build.
+    run("cargo", &["test", "--package", "xtask"])?;
     run("cargo", &["fmt", "--all", "--check"])?;
     run(
         "cargo",

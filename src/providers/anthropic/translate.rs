@@ -499,41 +499,111 @@ fn finish_cache_write(
     accounting
 }
 
+/// Ephemeral wire state for one Anthropic response, buffered or streamed.
+///
+/// Both paths read the same members off the same `usage` object; they differ only in how many
+/// events those members arrive on. Holding them in one type is what lets a single projection
+/// serve both, so a bucket cannot be mapped on one path and forgotten on the other.
+struct AnthropicUsageState {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    /// Cache-write details credited by the seeded parse, retained rather than consumed because a
+    /// provider detail object is a cumulative snapshot: a later object replaces the previous one,
+    /// an omitted object leaves it standing.
+    cache_write: CacheWriteAccumulator,
+    /// Whether any event has stated a per-class breakdown, which is what stops a later aggregate
+    /// from being attributed to the default class on top of details already credited.
+    cache_write_details_seen: bool,
+    reasoning_tokens: Option<u64>,
+}
+
+impl AnthropicUsageState {
+    /// Empty state for a response whose members have not arrived yet.
+    fn new(registry: CacheWriteClassRegistry) -> Self {
+        Self {
+            input_tokens: None,
+            output_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            cache_write: CacheWriteAccumulator::new(registry),
+            cache_write_details_seen: false,
+            reasoning_tokens: None,
+        }
+    }
+
+    /// Seeds from a complete buffered response.
+    ///
+    /// `accumulator` is the seeded parse's product, moved in. `reasoning_tokens` is the caller's
+    /// resolved value — the buffered translator takes it from a `thinking` content block — and
+    /// falls back to the usage object's own `thinking_tokens` when the caller has none.
+    fn from_response(
+        u: &AnthropicUsage,
+        reasoning_tokens: Option<u64>,
+        accumulator: CacheWriteAccumulator,
+    ) -> Self {
+        Self {
+            input_tokens: Some(u.input_tokens),
+            output_tokens: Some(u.output_tokens),
+            cache_creation_input_tokens: u.cache_creation_input_tokens,
+            cache_read_input_tokens: u.cache_read_input_tokens,
+            cache_write: accumulator,
+            cache_write_details_seen: u.cache_creation_present,
+            reasoning_tokens: reasoning_tokens.or_else(|| {
+                u.output_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.thinking_tokens)
+            }),
+        }
+    }
+
+    /// The single projection of this shape's wire state into the domain `Usage`.
+    ///
+    /// `accounting` is supplied by the caller rather than read from a constant here: the contract
+    /// belongs to the lane that dispatched the request, and a projection that inferred it would
+    /// be a second authority for the same fact.
+    ///
+    /// Takes `&self` and clones the accumulator rather than consuming it, because the stream
+    /// rebuilds usage on every terminal-bearing event and may still restate its cache-write
+    /// snapshot afterwards. The accumulator is bounded by construction, so the copy is too.
+    fn project(&self, accounting: UsageAccounting, pricing_context: &PricingContext) -> Usage {
+        let input = self.input_tokens.unwrap_or(0);
+        let output = self.output_tokens.unwrap_or(0);
+        let completion_tokens_details = self.reasoning_tokens.map(|r| CompletionTokensDetails {
+            reasoning_tokens: Some(r),
+        });
+        let cache_write = finish_cache_write(
+            self.cache_write.clone(),
+            self.cache_creation_input_tokens,
+            self.cache_write_details_seen,
+            pricing_context,
+        );
+
+        Usage {
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: input + output,
+            completion_tokens_details,
+            cache_creation_input_tokens: cache_write.published_tokens(),
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            prompt_tokens_details: None,
+            accounting,
+            image_units: None,
+            audio_seconds: None,
+            cache_write,
+        }
+    }
+}
+
 fn anthropic_usage_to_usage(
     u: &AnthropicUsage,
     reasoning_tokens: Option<u64>,
     pricing_context: &PricingContext,
     accumulator: CacheWriteAccumulator,
 ) -> Usage {
-    let reasoning = reasoning_tokens.or_else(|| {
-        u.output_tokens_details
-            .as_ref()
-            .and_then(|d| d.thinking_tokens)
-    });
-    let completion_tokens_details = reasoning.map(|r| CompletionTokensDetails {
-        reasoning_tokens: Some(r),
-    });
-    let total = u.input_tokens + u.output_tokens;
-    let cache_write = finish_cache_write(
-        accumulator,
-        u.cache_creation_input_tokens,
-        u.cache_creation_present,
-        pricing_context,
-    );
-
-    Usage {
-        prompt_tokens: u.input_tokens,
-        completion_tokens: u.output_tokens,
-        total_tokens: total,
-        completion_tokens_details,
-        cache_creation_input_tokens: cache_write.published_tokens(),
-        cache_read_input_tokens: u.cache_read_input_tokens,
-        prompt_tokens_details: None,
-        accounting: ANTHROPIC_ACCOUNTING,
-        image_units: None,
-        audio_seconds: None,
-        cache_write,
-    }
+    AnthropicUsageState::from_response(u, reasoning_tokens, accumulator)
+        .project(ANTHROPIC_ACCOUNTING, pricing_context)
 }
 
 /// Accumulates per-block state for a single concurrent tool call during streaming.
@@ -557,18 +627,9 @@ pub enum StreamErr {
 
 /// Stateful translator for Anthropic SSE stream -> OpenAI SSE.
 pub struct StreamTranslator {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cache_creation_input_tokens: Option<u64>,
-    cache_read_input_tokens: Option<u64>,
-    /// Cache-write details credited by the seeded parse of each event, retained across the stream
-    /// because a provider detail object is a cumulative snapshot: a later object replaces the
-    /// previous one, an omitted object leaves it standing.
-    cache_write: CacheWriteAccumulator,
-    /// Whether any event has stated a per-class breakdown, which is what stops a later aggregate
-    /// from being attributed to the default class on top of details already credited.
-    cache_write_details_seen: bool,
-    reasoning_tokens: Option<u64>,
+    /// This response's usage members, accumulated as the events arrive. Shared with the buffered
+    /// path so both project through one place.
+    usage: AnthropicUsageState,
     /// Concurrent tool-call accumulators keyed by Anthropic SSE block index.
     /// Entries are removed by ContentBlockStop. On mid-stream network drop the map is not
     /// explicitly drained — but it is dropped with the StreamTranslator at request end, so
@@ -599,15 +660,9 @@ impl StreamTranslator {
         cap_bytes: usize,
         pricing_context: PricingContext,
     ) -> Self {
-        let cache_write = CacheWriteAccumulator::new(pricing_context.registry().clone());
+        let usage = AnthropicUsageState::new(pricing_context.registry().clone());
         Self {
-            input_tokens: None,
-            output_tokens: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-            cache_write,
-            cache_write_details_seen: false,
-            reasoning_tokens: None,
+            usage,
             tool_blocks: HashMap::new(),
             next_openai_index: 0,
             cap_bytes,
@@ -629,7 +684,11 @@ impl StreamTranslator {
     /// commits into is this translator's own state; exposing it for the caller to pass back in
     /// would let a stream be parsed against an accumulator that is not its own.
     pub fn parse_event(&mut self, line: &str) -> Option<StreamEvent> {
-        parse_stream_event(line, self.pricing_context.registry(), &mut self.cache_write)
+        parse_stream_event(
+            line,
+            self.pricing_context.registry(),
+            &mut self.usage.cache_write,
+        )
     }
 
     /// Process an Anthropic stream event and optionally emit an OpenAI-format chunk.
@@ -637,14 +696,14 @@ impl StreamTranslator {
         match event {
             StreamEvent::MessageStart { message } => {
                 if let Some(ref u) = message.usage {
-                    self.input_tokens = Some(u.input_tokens);
-                    self.cache_creation_input_tokens = u.cache_creation_input_tokens;
-                    self.cache_read_input_tokens = u.cache_read_input_tokens;
+                    self.usage.input_tokens = Some(u.input_tokens);
+                    self.usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                    self.usage.cache_read_input_tokens = u.cache_read_input_tokens;
                     // The per-class detail tokens were credited into `cache_write` while this
                     // event was parsed; only the fact that a breakdown was stated is recorded
                     // here. An aggregate that disagrees with the details is legal input and
                     // reconciles at finalization rather than being asserted away.
-                    self.cache_write_details_seen |= u.cache_creation_present;
+                    self.usage.cache_write_details_seen |= u.cache_creation_present;
                 }
                 Ok(None)
             }
@@ -793,18 +852,19 @@ impl StreamTranslator {
                 Ok(None)
             }
             StreamEvent::MessageDelta { delta, usage: u } => {
-                self.output_tokens = Some(u.output_tokens);
+                self.usage.output_tokens = Some(u.output_tokens);
                 // Both aggregates are restatements, not increments: the same counts appear on
                 // message_start and again here, so the final statement stands and an event that
                 // omits a member leaves the standing value alone. The provider's last word is
                 // taken as its word even when it is smaller than the first — resolving a
                 // disagreement in either direction is a quantity decision, and a quantity the
                 // gateway chose rather than read may not be reported as an exact one.
-                self.cache_creation_input_tokens = u
+                self.usage.cache_creation_input_tokens = u
                     .cache_creation_input_tokens
-                    .or(self.cache_creation_input_tokens);
-                self.cache_read_input_tokens =
-                    u.cache_read_input_tokens.or(self.cache_read_input_tokens);
+                    .or(self.usage.cache_creation_input_tokens);
+                self.usage.cache_read_input_tokens = u
+                    .cache_read_input_tokens
+                    .or(self.usage.cache_read_input_tokens);
                 // Anthropic restates cache creation cumulatively rather than incrementally:
                 // the same values appear in message_start and again here. The seeded parse
                 // therefore replaces the detail snapshot instead of adding to it, which is
@@ -813,9 +873,9 @@ impl StreamTranslator {
                 // omits the object leaves the previous snapshot standing — which is what this
                 // event does in practice: it restates the cache-write aggregate but never the
                 // per-class breakdown, so message_start's snapshot stands.
-                self.cache_write_details_seen |= u.cache_creation_present;
+                self.usage.cache_write_details_seen |= u.cache_creation_present;
                 if let Some(ref d) = u.output_tokens_details {
-                    self.reasoning_tokens = d.thinking_tokens.or(self.reasoning_tokens);
+                    self.usage.reasoning_tokens = d.thinking_tokens.or(self.usage.reasoning_tokens);
                 }
                 let usage = self.build_usage();
                 let finish_reason = map_stop_reason(delta.stop_reason.as_deref());
@@ -848,35 +908,13 @@ impl StreamTranslator {
         }
     }
 
+    /// This stream's accumulated usage, projected through the shape's single projection.
+    ///
+    /// Kept as a method rather than inlined at its call site: usage is rebuilt on every
+    /// terminal-bearing event, and the name is what the stream's tests assert against.
     fn build_usage(&self) -> Usage {
-        let input = self.input_tokens.unwrap_or(0);
-        let output = self.output_tokens.unwrap_or(0);
-        let completion_tokens_details = self.reasoning_tokens.map(|r| CompletionTokensDetails {
-            reasoning_tokens: Some(r),
-        });
-        // Cloned rather than consumed: usage is rebuilt on every terminal-bearing event, and the
-        // stream may still restate its cache-write snapshot afterwards. The accumulator is
-        // bounded by construction, so the copy is too.
-        let cache_write = finish_cache_write(
-            self.cache_write.clone(),
-            self.cache_creation_input_tokens,
-            self.cache_write_details_seen,
-            &self.pricing_context,
-        );
-
-        Usage {
-            prompt_tokens: input,
-            completion_tokens: output,
-            total_tokens: input + output,
-            completion_tokens_details,
-            cache_creation_input_tokens: cache_write.published_tokens(),
-            cache_read_input_tokens: self.cache_read_input_tokens,
-            prompt_tokens_details: None,
-            accounting: ANTHROPIC_ACCOUNTING,
-            image_units: None,
-            audio_seconds: None,
-            cache_write,
-        }
+        self.usage
+            .project(ANTHROPIC_ACCOUNTING, &self.pricing_context)
     }
 }
 
@@ -1037,6 +1075,7 @@ mod tests {
     use crate::providers::anthropic::types::{
         AnthropicUsage, ContentBlock, MessagesResponse, MessagesResponseSeed, OutputTokensDetails,
     };
+    use crate::providers::usage_parity::assert_usage_parity;
 
     /// Parses a buffered response body exactly as the adapter does — seeded, so the cache-write
     /// detail object reaches the accumulator instead of an intermediate that would flatten it.
@@ -1088,7 +1127,9 @@ mod tests {
     }
 
     /// A pricing generation taken from the bundled catalogue, for tests whose subject is not
-    /// pricing. Its registry is the bundled union — today `{"5m", "1h"}`.
+    /// pricing. Its registry is the union of every cache-write class the catalogue prices, so it
+    /// grows with the pricing data; a test that needs a specific class should ask the registry
+    /// for that class rather than assume the union's contents or its order.
     fn bundled_pricing_context() -> PricingContext {
         use crate::config::PricingConfig;
         use crate::domain::pricing::{BUNDLED_PRICING_JSON, PricingDb};
@@ -2027,7 +2068,7 @@ mod tests {
         );
         let out = tr.process_event(&ev).unwrap();
         assert!(out.is_none());
-        assert_eq!(tr.input_tokens, Some(42));
+        assert_eq!(tr.usage.input_tokens, Some(42));
     }
 
     /// Streaming cache creation breakdown — MessageStart with cache_creation object.
@@ -2203,9 +2244,9 @@ mod tests {
             r#"{"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","usage":{"input_tokens":100,"output_tokens":0,"cache_creation_input_tokens":3500,"cache_read_input_tokens":2000,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}}}"#,
         );
         assert!(out.is_none());
-        assert_eq!(tr.input_tokens, Some(100));
-        assert_eq!(tr.cache_creation_input_tokens, Some(3500));
-        assert_eq!(tr.cache_read_input_tokens, Some(2000));
+        assert_eq!(tr.usage.input_tokens, Some(100));
+        assert_eq!(tr.usage.cache_creation_input_tokens, Some(3500));
+        assert_eq!(tr.usage.cache_read_input_tokens, Some(2000));
 
         let usage = tr.build_usage();
         assert_eq!(class_tokens(&usage.cache_write, "5m"), 1000);
@@ -2227,7 +2268,7 @@ mod tests {
             r#"{"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","usage":{"input_tokens":100,"output_tokens":0,"cache_creation_input_tokens":3500,"cache_read_input_tokens":2000}}}"#,
         );
         assert!(out.is_none());
-        assert_eq!(tr.cache_creation_input_tokens, Some(3500));
+        assert_eq!(tr.usage.cache_creation_input_tokens, Some(3500));
 
         let usage = tr.build_usage();
         assert_eq!(class_tokens(&usage.cache_write, "5m"), 3500);
@@ -2605,14 +2646,75 @@ mod tests {
         }
     }
 
-    /// The same facts reported over SSE and in a buffered body account identically. The two
-    /// paths run different deserializers, so this is the test that keeps them one behaviour.
-    #[test]
-    fn test_buffered_and_streaming_payloads_account_identically() {
-        let usage_json = r#"{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":3500,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#;
+    /// One buffered body and the equivalent stream events, stated as this shape reports them.
+    ///
+    /// `delta` omits `input_tokens` because Anthropic's `message_delta` does: the member is
+    /// documented as optional there, and nothing reads input tokens from that event.
+    struct ParityCase {
+        name: &'static str,
+        /// The `usage` member of the buffered response body.
+        buffered: &'static str,
+        /// The `usage` member of `message_start`'s `message`.
+        start: &'static str,
+        /// The `usage` member of the terminal `message_delta`.
+        delta: &'static str,
+    }
 
-        let buffered = buffered_usage(&buffered_body(usage_json), &bundled_pricing_context());
+    /// Every bucket this wire shape can report, stated once in a buffered body and once split
+    /// across the stream events that carry the same facts.
+    const PARITY_CASES: &[ParityCase] = &[
+        ParityCase {
+            name: "plain input and output only",
+            buffered: r#"{"input_tokens":100,"output_tokens":20}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0}"#,
+            delta: r#"{"output_tokens":20}"#,
+        },
+        ParityCase {
+            name: "cache read",
+            buffered: r#"{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":4096}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":4096}"#,
+            delta: r#"{"output_tokens":20}"#,
+        },
+        ParityCase {
+            name: "cache-creation aggregate with no per-class breakdown",
+            buffered: r#"{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":3500}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0,"cache_creation_input_tokens":3500}"#,
+            delta: r#"{"output_tokens":20}"#,
+        },
+        ParityCase {
+            name: "per-class 5m and 1h writes beside the aggregate",
+            buffered: r#"{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":3500,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0,"cache_creation_input_tokens":3500,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
+            delta: r#"{"output_tokens":20}"#,
+        },
+        ParityCase {
+            name: "per-class writes with no aggregate stated",
+            buffered: r#"{"input_tokens":100,"output_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
+            delta: r#"{"output_tokens":20}"#,
+        },
+        ParityCase {
+            name: "thinking tokens",
+            buffered: r#"{"input_tokens":100,"output_tokens":2000,"output_tokens_details":{"thinking_tokens":1500}}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0}"#,
+            delta: r#"{"output_tokens":2000,"output_tokens_details":{"thinking_tokens":1500}}"#,
+        },
+        ParityCase {
+            name: "every bucket at once",
+            buffered: r#"{"input_tokens":100,"output_tokens":2000,"cache_read_input_tokens":4096,"cache_creation_input_tokens":3500,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500},"output_tokens_details":{"thinking_tokens":1500}}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":4096,"cache_creation_input_tokens":3500,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
+            delta: r#"{"output_tokens":2000,"output_tokens_details":{"thinking_tokens":1500}}"#,
+        },
+        ParityCase {
+            name: "aggregate restated on the terminal event after details were seen",
+            buffered: r#"{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":3500,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
+            delta: r#"{"output_tokens":20,"cache_creation_input_tokens":3500}"#,
+        },
+    ];
 
+    /// Streams one case's `message_start` and terminal `message_delta`, then builds usage.
+    fn streamed_usage(case: &ParityCase) -> Usage {
         let mut tr = StreamTranslator::new(
             "claude-sonnet-4-5-20251022".into(),
             "rid".into(),
@@ -2622,38 +2724,262 @@ mod tests {
         feed(
             &mut tr,
             &format!(
-                r#"{{"type":"message_start","message":{{"id":"m1","type":"message","role":"assistant","usage":{usage_json}}}}}"#
+                r#"{{"type":"message_start","message":{{"id":"m1","type":"message","role":"assistant","usage":{}}}}}"#,
+                case.start
             ),
         );
         feed(
             &mut tr,
-            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":100,"output_tokens":20}}"#,
+            &format!(
+                r#"{{"type":"message_delta","delta":{{"stop_reason":"end_turn"}},"usage":{}}}"#,
+                case.delta
+            ),
+        );
+        tr.build_usage()
+    }
+
+    /// The same facts reported over SSE and in a buffered body account identically, on every
+    /// field. The two paths run different deserializers, so this is the test that keeps them one
+    /// behaviour — and it is what a single shared projection has to preserve exactly.
+    #[test]
+    fn test_buffered_and_streaming_payloads_account_identically() {
+        for case in PARITY_CASES {
+            let buffered =
+                buffered_usage(&buffered_body(case.buffered), &bundled_pricing_context());
+            let streamed = streamed_usage(case);
+            assert_usage_parity(&buffered, &streamed, case.name);
+        }
+    }
+
+    /// The stream may state a fact on one event and the rest on another; the accumulated result
+    /// is still the buffered one. This is the same parity assertion with the cache-write details
+    /// arriving alone on an intermediate event rather than on `message_start`.
+    #[test]
+    fn test_split_stream_events_accumulate_to_the_buffered_result() {
+        let buffered = buffered_usage(
+            &buffered_body(
+                r#"{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":4096,"cache_creation_input_tokens":3500,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
+            ),
+            &bundled_pricing_context(),
+        );
+
+        let mut tr = StreamTranslator::new(
+            "claude-sonnet-4-5-20251022".into(),
+            "rid".into(),
+            usize::MAX,
+            bundled_pricing_context(),
+        );
+        feed(
+            &mut tr,
+            r#"{"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":4096}}}"#,
+        );
+        // A non-terminal `message_delta` carrying the per-class breakdown and nothing else.
+        feed(
+            &mut tr,
+            r#"{"type":"message_delta","delta":{},"usage":{"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}}"#,
+        );
+        feed(
+            &mut tr,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20,"cache_creation_input_tokens":3500}}"#,
         );
         let streamed = tr.build_usage();
 
+        assert_usage_parity(&buffered, &streamed, "split across events");
+    }
+
+    /// Every downstream surface of one fully-populated Anthropic response, pinned to absolute
+    /// values.
+    ///
+    /// The projection this shape now shares between its two paths sits upstream of all of these,
+    /// so an arithmetic or mapping change inside it moves at least one number here. The values
+    /// are asserted against the synthetic fixture's fixed rates rather than against each other, so
+    /// surfaces that agree on a wrong figure cannot satisfy it, and a catalogue price refresh
+    /// cannot move them.
+    ///
+    /// **Two legs are deliberately not claimed:** the terminal `oxigate.usage` SSE event and the
+    /// budget increment are emitted by the request handler, which nothing in this module can
+    /// drive.
+    #[test]
+    fn test_every_accounted_surface_of_a_full_response_is_pinned() {
+        use crate::domain::auth::RequestIdentity;
+        use crate::domain::ports::NanoUsd;
+        use crate::domain::pricing::snapshot_pricing_context;
+        use crate::domain::spend::SpendRecord;
+        use crate::domain::usage_accounting::{
+            CostStatus, DuplicateAmbiguity, ReconciliationOutcome,
+        };
+        use crate::providers::usage_parity::{SYNTHETIC_MODEL, synthetic_pricing_holder};
+        use crate::utils::cost_headers::build_cost_headers;
+
+        const FULL_RESPONSE_USAGE: &str = r#"{"input_tokens":100,"output_tokens":2000,"cache_read_input_tokens":4096,"cache_creation_input_tokens":3500,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500},"output_tokens_details":{"thinking_tokens":1500}}"#;
+
+        let holder = synthetic_pricing_holder();
+        let usage = buffered_usage(
+            &buffered_body(FULL_RESPONSE_USAGE),
+            &snapshot_pricing_context(&holder),
+        );
+
+        // --- Usage, every field ---
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 2_000);
+        assert_eq!(usage.total_tokens, 2_100);
         assert_eq!(
-            buffered.cache_creation_input_tokens,
-            streamed.cache_creation_input_tokens
+            usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.reasoning_tokens),
+            Some(1_500)
+        );
+        assert_eq!(usage.cache_creation_input_tokens, Some(3_500));
+        assert_eq!(usage.cache_read_input_tokens, Some(4_096));
+        assert!(usage.prompt_tokens_details.is_none());
+        assert_eq!(usage.accounting, ANTHROPIC_ACCOUNTING);
+        assert!(usage.image_units.is_none());
+        assert!(usage.audio_seconds.is_none());
+        // The classes this fixture states, named once: these mirror the payload's own
+        // `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` members. They are not domain
+        // constants and must not be swapped for `ANTHROPIC_DEFAULT_CACHE_WRITE_CLASS` — that
+        // constant means "the class an unbroken-down aggregate belongs to", which is a different
+        // fact that happens to share a value.
+        const STATED: [(&str, u64); 2] = [("5m", 1_000), ("1h", 2_500)];
+        for (class, tokens) in STATED {
+            assert_eq!(class_tokens(&usage.cache_write, class), tokens);
+        }
+        assert_eq!(usage.cache_write.accounted_tokens(), 3_500);
+        assert_eq!(usage.cache_write.reported_tokens(), Some(3_500));
+        assert_eq!(usage.cache_write.detail_tokens(), 3_500);
+        assert_eq!(usage.cache_write.unknown_tokens(), 0);
+        assert_eq!(usage.cache_write.unmatched_residual_tokens(), 0);
+        assert_eq!(usage.cache_write.fallback_tokens(), 0);
+        assert!(!usage.cache_write.quantity_overflow());
+        assert!(usage.cache_write.partition_is_exact());
+        // Two detail observations, one per stated class; the aggregate is a restatement of the
+        // same quantity and is not itself an observation.
+        assert_eq!(usage.cache_write.observation_count(), 2);
+        assert_eq!(usage.cache_write.published_tokens(), Some(3_500));
+        assert_eq!(
+            usage.cache_write.duplicate(),
+            DuplicateAmbiguity {
+                configured_duplicate: false,
+                unknown_indeterminate: false,
+            }
         );
         assert_eq!(
-            buffered.cache_write.accounted_tokens(),
-            streamed.cache_write.accounted_tokens()
+            usage.cache_write.outcome(),
+            ReconciliationOutcome::Consistent
+        );
+        assert!(!usage.cache_write.evidence_truncated());
+        // The projection attaches the generation the request was dispatched under, and that
+        // generation is what prices the classes below.
+        let attached = usage
+            .cache_write
+            .pricing_context()
+            .expect("the projection attaches the request's pricing generation");
+        // What the projection guarantees is that the generation it attached is one that can price
+        // the classes this response reported — not what else the catalogue happens to contain.
+        // Asserting the catalogue's full class union here would couple this test to every other
+        // model's TTLs and break when an unrelated one gains a new class.
+        for (class, _) in STATED {
+            let canonical = CacheWriteClass::canonicalize(class)
+                .expect("the fixture states canonical durations");
+            assert!(
+                attached.registry().slot_of(&canonical).is_some(),
+                "the attached generation must price the reported class {class}"
+            );
+        }
+        let tier_rates = {
+            let inner = attached.db().read();
+            let entry = inner
+                .lookup(SYNTHETIC_MODEL, None)
+                .expect("the pinned model is in the synthetic fixture");
+            let tier = entry.get_tier(7_696);
+            (
+                tier.input_per_token,
+                tier.output_per_token,
+                tier.cache_read_multiplier,
+            )
+        };
+        assert_eq!(tier_rates, (2e-06, 1e-05, Some(0.5)));
+
+        let (headers, finalized) = build_cost_headers(SYNTHETIC_MODEL, &usage, holder, false);
+
+        // --- TokenUsage, every field ---
+        let tu = &finalized.token_usage;
+        assert_eq!(tu.input_tokens, 100);
+        assert_eq!(tu.output_tokens, 2_000);
+        assert_eq!(tu.standard_output_tokens(), 500);
+        assert_eq!(tu.cache_read_input_tokens, 4_096);
+        assert_eq!(tu.cache_write.accounted_tokens(), 3_500);
+        assert_eq!(tu.thinking_tokens, 1_500);
+        assert_eq!(tu.image_count, 0);
+        assert_eq!(tu.audio_seconds, 0.0);
+        assert!(!tu.batch);
+        assert_eq!(
+            tu.reasoning_accounting,
+            ReasoningAccounting::IncludedInOutput
+        );
+        // The tier comparator reads the whole prompt, cached and cache-written tokens
+        // included, so it is part of what this shape's projection has to feed correctly.
+        assert_eq!(tu.context_input_tokens(), 7_696);
+
+        // --- Cost, every component, at the synthetic fixture's rates ---
+        // input 100 x 2_000 nano-USD = 200_000; cache read 4_096 x 2_000 x 0.5 = 4_096_000;
+        // writes 1_000 x 2_000 x 1.5 + 2_500 x 2_000 x 3.0 = 18_000_000; standard output
+        // 500 x 10_000 = 5_000_000; thinking 1_500 x 10_000 = 15_000_000; total 42_296_000.
+        let cost = &finalized.cost;
+        assert_eq!(cost.input_cost, NanoUsd(200_000));
+        assert_eq!(cost.cached_input_cost, NanoUsd(4_096_000));
+        assert_eq!(cost.cache_write_cost, NanoUsd(18_000_000));
+        assert_eq!(cost.output_cost, NanoUsd(5_000_000));
+        assert_eq!(cost.thinking_cost, NanoUsd(15_000_000));
+        assert_eq!(cost.image_cost, NanoUsd(0));
+        assert_eq!(cost.audio_cost, NanoUsd(0));
+        assert_eq!(cost.total_cost, NanoUsd(42_296_000));
+        assert_eq!(cost.status, CostStatus::Exact);
+
+        // --- The emitted headers ---
+        assert_eq!(
+            headers
+                .get(crate::utils::cost_headers::CostHeader::REQUEST_COST)
+                .and_then(|v| v.to_str().ok()),
+            Some(cost.total_cost.to_display_string()).as_deref()
         );
         assert_eq!(
-            buffered.cache_write.class_totals(),
-            streamed.cache_write.class_totals()
+            headers
+                .get(crate::utils::cost_headers::CostHeader::COST_STATUS)
+                .and_then(|v| v.to_str().ok()),
+            Some("exact")
         );
-        assert_eq!(
-            buffered.cache_write.outcome(),
-            streamed.cache_write.outcome()
+
+        // --- The persisted row, every column, and the bounded evidence document verbatim ---
+        let record = SpendRecord::build(
+            &RequestIdentity::default(),
+            SYNTHETIC_MODEL,
+            "anthropic",
+            &finalized,
+            7,
         );
+        assert_eq!(record.org_id, "default");
+        assert_eq!(record.identity_id, "default");
+        assert_eq!(record.tags, serde_json::json!({}));
+        assert_eq!(record.model, SYNTHETIC_MODEL);
+        assert_eq!(record.provider, "anthropic");
+        assert_eq!(record.prompt_tokens, 100);
+        assert_eq!(record.completion_tokens, 2_000);
+        assert_eq!(record.cache_read_tokens, 4_096);
+        assert_eq!(record.thinking_tokens, 1_500);
+        assert_eq!(record.cost_nano_usd, NanoUsd(42_296_000));
+        assert_eq!(record.cost_status, CostStatus::Exact);
+        assert_eq!(record.latency_ms, 7);
         assert_eq!(
-            buffered.cache_write.duplicate(),
-            streamed.cache_write.duplicate()
-        );
-        assert_eq!(
-            buffered.cache_write.evidence_entries(),
-            streamed.cache_write.evidence_entries()
+            serde_json::to_string(
+                record
+                    .usage_evidence
+                    .as_ref()
+                    .expect("an accounted cache write persists its evidence")
+            )
+            .expect("the evidence document serializes"),
+            r#"{"schema_version":1,"cache_write":{"reported_tokens":3500,"detail_tokens":3500,"accounted_tokens":3500,"component_cost_nano_usd":18000000,"reconciliation":"consistent","unknown_duplicates_indeterminate":false,"quantity_overflow":false,"entries":[{"raw_key":"ephemeral_5m_input_tokens","canonical_class":"5m","tokens":1000},{"raw_key":"ephemeral_1h_input_tokens","canonical_class":"1h","tokens":2500}],"incomplete":false}}"#
         );
     }
 
@@ -2862,8 +3188,8 @@ mod tests {
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":8,"output_tokens":16,"cache_creation_input_tokens":10,"cache_read_input_tokens":5}}"#,
         );
 
-        assert_eq!(tr.cache_creation_input_tokens, Some(10));
-        assert_eq!(tr.cache_read_input_tokens, Some(5));
+        assert_eq!(tr.usage.cache_creation_input_tokens, Some(10));
+        assert_eq!(tr.usage.cache_read_input_tokens, Some(5));
     }
 
     /// A member the event omits leaves the standing value alone rather than clearing it: only a
@@ -2880,8 +3206,8 @@ mod tests {
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":8,"output_tokens":16,"cache_creation_input_tokens":7601}}"#,
         );
 
-        assert_eq!(tr.cache_creation_input_tokens, Some(7601));
-        assert_eq!(tr.cache_read_input_tokens, Some(2000));
+        assert_eq!(tr.usage.cache_creation_input_tokens, Some(7601));
+        assert_eq!(tr.usage.cache_read_input_tokens, Some(2000));
     }
 
     /// The old nested position is no longer honoured. A frame that puts `usage` inside `delta`

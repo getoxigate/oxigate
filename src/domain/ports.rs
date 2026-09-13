@@ -530,6 +530,11 @@ impl AttemptedMeta {
 ///
 /// Gateway-level tool schema validation has already run before dispatch; implement only
 /// provider-specific constraints (e.g. tool count limits, supported tool_choice values).
+///
+/// Most methods here carry a default body. A wrapper that delegates to an inner adapter has to
+/// forward each of them explicitly: an un-forwarded method compiles and answers from the trait
+/// default, silently discarding the inner adapter's override. Add a forwarder to every wrapper
+/// when adding a defaulted method here.
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync + 'static {
     /// Performs a non-streaming chat completion.

@@ -100,6 +100,30 @@ single shared unknown bucket, priced at the same fallback rate: several unrecogn
 one response are one bucket, not several classes. The raw values are preserved in the persisted
 evidence so an unrecognised duration stays legible.
 
+### Usage-field audit
+
+Every member of the usage object AWS documents for the Converse API, and what the gateway does with
+it.
+
+- **Audited object:** `TokenUsage` — the `usage` of `ConverseResponse` and of
+  `ConverseStreamMetadataEvent` — with `CacheDetail` and its `CacheTTL` enum.
+- **Source:** `boto/botocore` @ `e3091ae01b90bb7fb4838f91a1fe545abbb47dd5`,
+  `botocore/data/bedrock-runtime/2023-09-30/service-2.json` (Bedrock Runtime API `2023-09-30`).
+  Accessed 2026-09-11.
+
+| Member | Gateway use |
+|---|---|
+| `inputTokens` | `prompt_tokens`. Charged whole at the input rate — the cache buckets sit beside it |
+| `outputTokens` | `completion_tokens`. Charged at the output rate |
+| `totalTokens` | Not read. The gateway reports `inputTokens + outputTokens` as `total_tokens`; not priced |
+| `cacheReadInputTokens` | `cache_read_input_tokens`. Charged at the tier's `cache_read_multiplier` |
+| `cacheWriteInputTokens` | The cache-write aggregate. Reconciled against `cacheDetails`, never summed with it |
+| `cacheDetails[].ttl` | The cache-write class. `CacheTTL` documents `5m` and `1h`; any other value is priced at the fallback rate |
+| `cacheDetails[].inputTokens` | The tokens written for that class, at the tier's multiplier for it |
+
+Every member that carries a quantity is billed. `totalTokens` is the only member not read, and it
+is a total of other members rather than a quantity of its own.
+
 ---
 
 ## Tool Use

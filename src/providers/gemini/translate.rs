@@ -503,11 +503,8 @@ pub fn gemini_to_openai(
     let usage = resp
         .usage_metadata
         .as_ref()
-        .map(usage_metadata_to_usage)
-        .unwrap_or(Usage {
-            accounting: GEMINI_ACCOUNTING,
-            ..Default::default()
-        });
+        .map(|u| usage_metadata_to_usage(u, GEMINI_ACCOUNTING))
+        .unwrap_or_else(|| usage_metadata_to_usage(&UsageMetadata::default(), GEMINI_ACCOUNTING));
 
     let id = format!("chatcmpl-{request_id}");
 
@@ -542,7 +539,12 @@ fn map_finish_reason(reason: &str) -> String {
     }
 }
 
-fn usage_metadata_to_usage(u: &UsageMetadata) -> Usage {
+/// The single projection for the `generateContent` wire shape, buffered and streamed.
+///
+/// `accounting` is the contract the counts are billed under; every caller passes
+/// `GEMINI_ACCOUNTING`. A response without `usageMetadata` is projected from
+/// `UsageMetadata::default()`, which yields zero counts and no optional member.
+fn usage_metadata_to_usage(u: &UsageMetadata, accounting: UsageAccounting) -> Usage {
     let prompt = u.prompt_token_count.unwrap_or(0) as u64;
     let completion = u.candidates_token_count.unwrap_or(0) as u64;
     let cached = u.cached_content_token_count.unwrap_or(0) as u64;
@@ -561,7 +563,7 @@ fn usage_metadata_to_usage(u: &UsageMetadata) -> Usage {
         cache_creation_input_tokens: None,
         cache_read_input_tokens: if cached > 0 { Some(cached) } else { None },
         prompt_tokens_details: None,
-        accounting: GEMINI_ACCOUNTING,
+        accounting,
         image_units: None,
         audio_seconds: None,
         ..Default::default()
@@ -631,7 +633,7 @@ pub fn gemini_stream_chunk_to_sse(
             usage_from
                 .and_then(|u| u.usage_metadata.as_ref())
                 .or(chunk.usage_metadata.as_ref())
-                .map(usage_metadata_to_usage)
+                .map(|u| usage_metadata_to_usage(u, GEMINI_ACCOUNTING))
         } else {
             None
         };
@@ -642,7 +644,7 @@ pub fn gemini_stream_chunk_to_sse(
             usage_from
                 .and_then(|u| u.usage_metadata.as_ref())
                 .or(chunk.usage_metadata.as_ref())
-                .map(usage_metadata_to_usage)
+                .map(|u| usage_metadata_to_usage(u, GEMINI_ACCOUNTING))
         } else {
             None
         };
@@ -720,6 +722,7 @@ mod tests {
     use crate::domain::chat::MessageContent;
     use crate::domain::ports::TokenUsage;
     use crate::providers::gemini::types::Candidate;
+    use crate::providers::usage_parity::assert_usage_parity;
     use crate::utils::cost_headers::build_cost_headers;
 
     fn pricing_holder() -> std::sync::Arc<std::sync::RwLock<crate::domain::pricing::PricingDb>> {
@@ -1124,20 +1127,33 @@ mod tests {
         );
     }
 
-    /// Both `Usage` construction paths — populated `usageMetadata` and the absent-metadata
-    /// fallback — apply the same accounting declaration, so the zero-usage case is not billed
-    /// under the type default while the populated case is billed under Gemini's contract.
+    /// Populated and absent `usageMetadata` apply the same accounting declaration, so the
+    /// zero-usage case is not billed under the type default while the populated case is billed
+    /// under Gemini's contract.
     #[test]
     fn test_both_usage_paths_apply_the_same_accounting() {
-        let populated = usage_metadata_to_usage(&UsageMetadata {
-            prompt_token_count: Some(10),
-            candidates_token_count: Some(5),
-            total_token_count: Some(15),
-            cached_content_token_count: None,
-            thoughts_token_count: None,
-        });
+        let populated = gemini_to_openai(
+            &text_response(Some(UsageMetadata {
+                prompt_token_count: Some(10),
+                candidates_token_count: Some(5),
+                total_token_count: Some(15),
+                cached_content_token_count: None,
+                thoughts_token_count: None,
+            })),
+            "gemini-2.5-pro",
+            "req-1",
+        )
+        .expect("must translate");
+        let absent = gemini_to_openai(&text_response(None), "gemini-2.5-pro", "req-1")
+            .expect("must translate");
 
-        let resp = GeminiChatResponse {
+        assert_eq!(populated.usage.accounting, GEMINI_ACCOUNTING);
+        assert_eq!(absent.usage.accounting, GEMINI_ACCOUNTING);
+    }
+
+    /// A one-candidate text response carrying `usage_metadata`, or none.
+    fn text_response(usage_metadata: Option<UsageMetadata>) -> GeminiChatResponse {
+        GeminiChatResponse {
             candidates: vec![Candidate {
                 content: Some(Content {
                     role: Some("model".into()),
@@ -1148,14 +1164,201 @@ mod tests {
                 finish_reason: Some("STOP".into()),
                 index: Some(0),
             }],
-            usage_metadata: None,
+            usage_metadata,
             model_version: None,
             prompt_feedback: None,
-        };
-        let absent = gemini_to_openai(&resp, "gemini-2.5-pro", "req-1").expect("must translate");
+        }
+    }
 
-        assert_eq!(populated.accounting, GEMINI_ACCOUNTING);
-        assert_eq!(absent.usage.accounting, GEMINI_ACCOUNTING);
+    /// A response with no `usageMetadata` projects exactly the value the translator has always
+    /// produced for it: every count zero, no optional member, Gemini's accounting.
+    ///
+    /// The expected value is written out as a literal so the comparison is against a fixed
+    /// value, not against whatever the projection happens to return for an empty input.
+    #[test]
+    fn test_absent_usage_metadata_projects_zero_usage_under_gemini_accounting() {
+        let absent = gemini_to_openai(&text_response(None), "gemini-2.5-pro", "req-1")
+            .expect("must translate");
+        let expected = Usage {
+            accounting: GEMINI_ACCOUNTING,
+            ..Default::default()
+        };
+
+        assert_usage_parity(&expected, &absent.usage, "absent usageMetadata");
+    }
+
+    /// The buffered translator and both terminal stream arms — a chunk that still carries a
+    /// candidate, and a candidate-less trailing chunk — project one `usageMetadata` identically,
+    /// including when Vertex delivers it on a separate chunk (`usage_from`).
+    #[test]
+    fn test_buffered_and_streamed_usage_metadata_project_identically() {
+        let metadata = UsageMetadata {
+            prompt_token_count: Some(150_000),
+            candidates_token_count: Some(1_000),
+            total_token_count: Some(151_200),
+            cached_content_token_count: Some(100_000),
+            thoughts_token_count: Some(200),
+        };
+        let buffered = gemini_to_openai(
+            &text_response(Some(metadata.clone())),
+            "gemini-2.5-pro",
+            "req-1",
+        )
+        .expect("must translate")
+        .usage;
+
+        let candidate_less = GeminiChatResponse {
+            candidates: vec![],
+            ..text_response(Some(metadata.clone()))
+        };
+        let streamed = |chunk: &GeminiChatResponse, usage_from: Option<&GeminiChatResponse>| {
+            gemini_stream_chunk_to_sse(chunk, "gemini-2.5-pro", "req-1", 12345, true, usage_from)
+                .expect("must produce SSE")
+                .expect("the last chunk is emitted")
+                .usage
+                .expect("the last chunk carries usage")
+        };
+
+        assert_usage_parity(
+            &buffered,
+            &streamed(&text_response(Some(metadata.clone())), None),
+            "terminal chunk with a candidate",
+        );
+        assert_usage_parity(
+            &buffered,
+            &streamed(&candidate_less, None),
+            "candidate-less terminal chunk",
+        );
+        assert_usage_parity(
+            &buffered,
+            &streamed(&text_response(None), Some(&candidate_less)),
+            "usage delivered on a separate chunk",
+        );
+    }
+
+    /// Every downstream surface of one fully-populated Gemini response, pinned to absolute
+    /// values.
+    ///
+    /// Priced against the synthetic fixture's fixed rates — $2/Mtok input, $10/Mtok output, cache
+    /// reads at 0.5x input, no separate thinking rate — so a catalogue price refresh cannot move
+    /// these values. promptTokenCount 150,000 containing 100,000 cached, candidates 1,000,
+    /// thoughts 200:
+    ///
+    /// - input: (150,000 − 100,000) × 2,000 nano-USD = 100,000,000
+    /// - cached input: 100,000 × 2,000 × 0.5 = 100,000,000
+    /// - output: 1,000 × 10,000 = 10,000,000
+    /// - thinking, additive beside the candidates: 200 × 10,000 = 2,000,000
+    /// - total: 212,000,000
+    ///
+    /// **Two legs are deliberately not claimed:** the terminal `oxigate.usage` SSE event and the
+    /// budget increment are emitted by the request handler, which nothing in this module can
+    /// drive.
+    #[test]
+    fn test_every_accounted_surface_of_a_full_gemini_response_is_pinned() {
+        use crate::domain::auth::RequestIdentity;
+        use crate::domain::ports::NanoUsd;
+        use crate::domain::spend::SpendRecord;
+        use crate::domain::usage_accounting::CostStatus;
+        use crate::providers::usage_parity::{SYNTHETIC_MODEL, synthetic_pricing_holder};
+        use crate::utils::cost_headers::CostHeader;
+
+        const MODEL: &str = SYNTHETIC_MODEL;
+        let usage = gemini_to_openai(
+            &text_response(Some(UsageMetadata {
+                prompt_token_count: Some(150_000),
+                candidates_token_count: Some(1_000),
+                total_token_count: Some(151_200),
+                cached_content_token_count: Some(100_000),
+                thoughts_token_count: Some(200),
+            })),
+            MODEL,
+            "req-1",
+        )
+        .expect("must translate")
+        .usage;
+
+        // --- Usage, every field: this shape reports no cache writes, so its cache-write
+        // accounting is the empty default with no pricing generation attached ---
+        let expected = Usage {
+            prompt_tokens: 150_000,
+            completion_tokens: 1_000,
+            total_tokens: 151_200,
+            completion_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: Some(200),
+            }),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(100_000),
+            prompt_tokens_details: None,
+            accounting: GEMINI_ACCOUNTING,
+            cache_write: Default::default(),
+            image_units: None,
+            audio_seconds: None,
+        };
+        assert_usage_parity(&expected, &usage, "full Gemini response");
+
+        let (headers, finalized) =
+            build_cost_headers(MODEL, &usage, synthetic_pricing_holder(), false);
+
+        // --- TokenUsage, every field ---
+        let tu = &finalized.token_usage;
+        assert_eq!(tu.input_tokens, 50_000);
+        assert_eq!(tu.output_tokens, 1_000);
+        assert_eq!(tu.standard_output_tokens(), 1_000);
+        assert_eq!(tu.cache_read_input_tokens, 100_000);
+        assert_eq!(tu.cache_write.accounted_tokens(), 0);
+        assert_eq!(tu.thinking_tokens, 200);
+        assert_eq!(tu.image_count, 0);
+        assert_eq!(tu.audio_seconds, 0.0);
+        assert!(!tu.batch);
+        assert_eq!(tu.reasoning_accounting, ReasoningAccounting::Additive);
+        // Inclusive: the reported prompt already contains the cached portion.
+        assert_eq!(tu.context_input_tokens(), 150_000);
+
+        // --- Cost, every component ---
+        let cost = &finalized.cost;
+        assert_eq!(cost.input_cost, NanoUsd(100_000_000));
+        assert_eq!(cost.cached_input_cost, NanoUsd(100_000_000));
+        assert_eq!(cost.cache_write_cost, NanoUsd(0));
+        assert_eq!(cost.output_cost, NanoUsd(10_000_000));
+        assert_eq!(cost.thinking_cost, NanoUsd(2_000_000));
+        assert_eq!(cost.image_cost, NanoUsd(0));
+        assert_eq!(cost.audio_cost, NanoUsd(0));
+        assert_eq!(cost.total_cost, NanoUsd(212_000_000));
+        assert_eq!(cost.status, CostStatus::Exact);
+
+        // --- The emitted headers ---
+        assert_eq!(
+            headers
+                .get(CostHeader::REQUEST_COST)
+                .and_then(|v| v.to_str().ok()),
+            Some(cost.total_cost.to_display_string()).as_deref()
+        );
+        assert_eq!(
+            headers
+                .get(CostHeader::COST_STATUS)
+                .and_then(|v| v.to_str().ok()),
+            Some("exact")
+        );
+
+        // --- The persisted row, every column ---
+        let record =
+            SpendRecord::build(&RequestIdentity::default(), MODEL, "google", &finalized, 7);
+        assert_eq!(record.org_id, "default");
+        assert_eq!(record.identity_id, "default");
+        assert_eq!(record.tags, serde_json::json!({}));
+        assert_eq!(record.model, MODEL);
+        assert_eq!(record.provider, "google");
+        assert_eq!(record.prompt_tokens, 50_000);
+        assert_eq!(record.completion_tokens, 1_000);
+        assert_eq!(record.cache_read_tokens, 100_000);
+        assert_eq!(record.thinking_tokens, 200);
+        assert_eq!(record.cost_nano_usd, NanoUsd(212_000_000));
+        assert_eq!(record.cost_status, CostStatus::Exact);
+        assert!(
+            record.usage_evidence.is_none(),
+            "no cache write was reported, so there is no evidence document"
+        );
+        assert_eq!(record.latency_ms, 7);
     }
 
     /// Tier selection reads the total prompt context of a cached Gemini request.

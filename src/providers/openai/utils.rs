@@ -62,18 +62,26 @@ pub(crate) const AZURE_ACCOUNTING: UsageAccounting = UsageAccounting {
     reasoning: ReasoningAccounting::IncludedInOutput,
 };
 
-/// Token accounting assumed for a generic OpenAI-compatible backend.
+/// Token accounting assumed for a generic OpenAI-compatible backend — an **unverified fallback**,
+/// not a sourced declaration and not a neutral one.
 ///
 /// Deliberately the gateway's historical behaviour on both axes, and deliberately **not** copied
 /// from `OPENAI_ACCOUNTING`. Speaking the OpenAI wire format proves what fields a backend emits,
-/// not how it counts them: a third-party backend may report reasoning beside the completion total
-/// rather than inside it, and no first-party reference covers "any backend that accepts this
-/// schema".
+/// not how it counts them, and no first-party reference covers "any backend that accepts this
+/// schema". Both axes are populated by this lane and both move billing, so the consequence of
+/// each assumption is stated rather than hidden:
 ///
-/// The consequence is stated rather than hidden: where a compat backend does count reasoning
-/// inside its completion total, that subset is charged twice until a captured payload from that
-/// backend justifies a per-instance declaration. Changing this value on the strength of the wire
-/// format alone would be an unverified billing change.
+/// - **Cache, assumed inclusive.** Cache reads are carved out of `prompt_tokens` before the
+///   remainder is charged at the plain input rate. Where a backend reports cached tokens beside
+///   the prompt rather than inside it, the plain input is undercharged by the cached quantity;
+///   where they exceed the prompt, the remainder clamps to zero and `cache_exceeds_prompt` is
+///   flagged.
+/// - **Reasoning, assumed additive.** Reasoning tokens are charged beside `completion_tokens`.
+///   Where a backend counts reasoning inside its completion total, that subset is charged twice.
+///
+/// Either value changes only on a captured payload from a specific backend justifying a
+/// per-instance declaration. Changing it on the strength of the wire format alone would be an
+/// unverified billing change.
 pub(crate) const COMPAT_DEFAULT_ACCOUNTING: UsageAccounting = UsageAccounting {
     cache: CacheAccounting::Inclusive,
     reasoning: ReasoningAccounting::Additive,
@@ -266,7 +274,7 @@ pub async fn map_openai_error_response(
 /// independently maintained copies.
 #[cfg(test)]
 pub(crate) mod cache_write_fixture {
-    use crate::domain::chat::Usage;
+    use crate::domain::chat::{Usage, UsageAccounting};
 
     /// The bundled entry these tests price against, and the only tier they reach.
     ///
@@ -331,8 +339,29 @@ pub(crate) mod cache_write_fixture {
         crate::utils::cost_headers::build_cost_headers(MODEL, usage, pricing_holder(), false).1
     }
 
-    /// Asserts a declared lane accounted the write as class `30m` and billed it at 1.25x net.
-    pub(crate) fn assert_accounted_and_billed(usage: &Usage) {
+    /// Asserts the usage passed through `normalize_openai_usage` under the lane's own contract.
+    ///
+    /// Both halves are needed. The cache-read mapping is what shows normalization ran at all —
+    /// the wire payload carries only `prompt_tokens_details.cached_tokens`. The accounting value
+    /// is what shows it ran with *this lane's* constant; the fixture carries no reasoning tokens,
+    /// so cost alone cannot tell one reasoning contract from another, and the compat lane's
+    /// constant equals the type default, so on that lane the stamp is visible only here.
+    fn assert_normalized_under(usage: &Usage, expected: UsageAccounting) {
+        assert_eq!(
+            usage.cache_read_input_tokens,
+            Some(2_000),
+            "normalization maps `cached_tokens` onto the priced cache-read bucket"
+        );
+        assert_eq!(
+            usage.accounting, expected,
+            "the lane stamps its own accounting contract"
+        );
+    }
+
+    /// Asserts a declared lane normalized under `expected`, accounted the write as class `30m`
+    /// and billed it at 1.25x net.
+    pub(crate) fn assert_accounted_and_billed(usage: &Usage, expected: UsageAccounting) {
+        assert_normalized_under(usage, expected);
         assert_eq!(
             usage.cache_creation_input_tokens,
             Some(1_000),
@@ -364,10 +393,12 @@ pub(crate) mod cache_write_fixture {
         );
     }
 
-    /// Asserts an undeclared lane accounted nothing and its money did not move.
+    /// Asserts an undeclared lane normalized under `expected`, accounted nothing, and its money
+    /// did not move.
     ///
     /// The echoed wire field is asserted by the caller, which is the half that *does* change.
-    pub(crate) fn assert_unaccounted_and_unbilled(usage: &Usage) {
+    pub(crate) fn assert_unaccounted_and_unbilled(usage: &Usage, expected: UsageAccounting) {
+        assert_normalized_under(usage, expected);
         assert_eq!(
             usage.cache_creation_input_tokens, None,
             "an undeclared lane publishes no accounted quantity"

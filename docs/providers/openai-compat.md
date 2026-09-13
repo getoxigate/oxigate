@@ -276,6 +276,43 @@ budget counter.
 `X-Oxigate-Input-Tokens` and `X-Oxigate-Output-Tokens` report the backend's own figures verbatim on
 every instance. Only what is charged at each rate is subject to the assumptions above.
 
+### Usage-field audit
+
+This adapter has no single documenting provider, so the audit covers **the OpenAI wire schema
+only** — the members this adapter parses because they are on that wire — and **inherits none of
+OpenAI's semantics**. For every member below, what it counts and what a backend charges for it is
+not established for any particular backend; the "Gateway use" column says what the gateway does
+with the number, not what the number means.
+
+- **Audited object:** OpenAI's `CompletionUsage` — the `usage` of `CreateChatCompletionResponse` and
+  of the final `CreateChatCompletionStreamResponse` chunk.
+- **Source:** `openai/openai-openapi` @ `38170fdddbb6a1813eae6c6587ee17cf2987185b`,
+  `openapi.yaml`, `#/components/schemas/CompletionUsage`. Accessed 2026-09-11.
+
+**Not read** means the member plays no part in cost, cost status, the spend row or the budget
+counter; the client still sees it wherever the backend's body is passed through.
+
+| Member | Gateway use |
+|---|---|
+| `prompt_tokens` | `prompt_tokens`. Charged at the input rate after `cached_tokens` is carved out, under the cache assumption above |
+| `completion_tokens` | `completion_tokens`. Charged whole at the output rate |
+| `total_tokens` | `total_tokens`. Reported, not priced |
+| `prompt_tokens_details.cached_tokens` | `cache_read_input_tokens`. Charged at the tier's `cache_read_multiplier` |
+| `prompt_tokens_details.cache_write_tokens` | Echoed, not accounted — see [Cache writes are echoed, not priced](#cache-writes-are-echoed-not-priced) |
+| `prompt_tokens_details.audio_tokens` | Not read. Stays inside `prompt_tokens` |
+| `prompt_tokens_details.text_tokens` | Not read. Stays inside `prompt_tokens` |
+| `prompt_tokens_details.image_tokens` | Not read. Stays inside `prompt_tokens` |
+| `completion_tokens_details.reasoning_tokens` | `completion_tokens_details.reasoning_tokens`. Charged at the thinking rate **beside** the completion total, under the reasoning assumption above |
+| `completion_tokens_details.audio_tokens` | Not read. Stays inside `completion_tokens` |
+| `completion_tokens_details.text_tokens` | Not read. Stays inside `completion_tokens` |
+| `completion_tokens_details.accepted_prediction_tokens` | Not read. Stays inside `completion_tokens` |
+| `completion_tokens_details.rejected_prediction_tokens` | Not read. Stays inside `completion_tokens` |
+
+**Members a backend adds outside this schema are not read.** A backend-specific usage member — a
+vendor's own cache or reasoning counter, say — plays no part in cost until a captured payload from
+that backend establishes what it counts. Capture a real response first; do not infer a member's
+meaning from its name.
+
 ---
 
 ## Feature / behaviour table

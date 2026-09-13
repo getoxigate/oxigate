@@ -104,6 +104,34 @@ This is deliberate. Declaring OpenAI's accounting for arbitrary third-party back
 unverified billing change; the declaration will be made per backend once a captured payload
 establishes what that backend actually reports. See `openai-compat.md`.
 
+### Usage-field audit
+
+Every member of the usage object OpenAI documents, and what the gateway does with it.
+
+- **Audited object:** `CompletionUsage` — the `usage` of `CreateChatCompletionResponse` and of the
+  final `CreateChatCompletionStreamResponse` chunk.
+- **Source:** `openai/openai-openapi` @ `38170fdddbb6a1813eae6c6587ee17cf2987185b`,
+  `openapi.yaml`, `#/components/schemas/CompletionUsage`. Accessed 2026-09-11.
+
+**Not read** means the member plays no part in cost, cost status, the spend row or the budget
+counter. A client can still see it where the response body is passed through.
+
+| Member | Gateway use |
+|---|---|
+| `prompt_tokens` | `prompt_tokens`. Charged at the input rate after the cached and cache-write subsets are carved out |
+| `completion_tokens` | `completion_tokens`. Charged at the output rate after the reasoning subset is carved out |
+| `total_tokens` | `total_tokens`. Reported, not priced |
+| `prompt_tokens_details.cached_tokens` | `cache_read_input_tokens`. Charged at the tier's `cache_read_multiplier` |
+| `prompt_tokens_details.cache_write_tokens` | A `30m` cache write, republished on `cache_creation_input_tokens` (see [Cache writes](#cache-writes)) |
+| `prompt_tokens_details.audio_tokens` | Not read. Audio input stays inside `prompt_tokens` and is charged at the text input rate. No bundled entry is an audio-capable chat model, so a request to one reports `cost-unavailable`. The pricing schema has no audio-token rate, so an operator-supplied entry for such a model charges its audio at the text rate |
+| `prompt_tokens_details.text_tokens` | Not read. A breakdown of `prompt_tokens`, already charged there |
+| `prompt_tokens_details.image_tokens` | Not read. A breakdown of `prompt_tokens`, already charged there at the input rate |
+| `completion_tokens_details.reasoning_tokens` | `completion_tokens_details.reasoning_tokens`. Charged once at the thinking rate |
+| `completion_tokens_details.audio_tokens` | Not read. Audio output stays inside `completion_tokens` and is charged at the text output rate; same catalogue position as audio input |
+| `completion_tokens_details.text_tokens` | Not read. A breakdown of `completion_tokens` |
+| `completion_tokens_details.accepted_prediction_tokens` | Not read. Part of the completion, already charged inside `completion_tokens` |
+| `completion_tokens_details.rejected_prediction_tokens` | Not read. The schema states these "are still counted in the total completion tokens for purposes of billing", so they are already charged inside `completion_tokens` |
+
 ---
 
 ## Reasoning models (o-series)

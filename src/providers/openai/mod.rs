@@ -693,7 +693,7 @@ mod tests {
             .await
             .expect("chat must succeed");
 
-        fixture::assert_accounted_and_billed(&resp.usage);
+        fixture::assert_accounted_and_billed(&resp.usage, OPENAI_ACCOUNTING);
     }
 
     /// The same seam on the SSE path, which normalizes inside the stream rather than after it.
@@ -740,6 +740,7 @@ mod tests {
 
         fixture::assert_accounted_and_billed(
             &last_usage.expect("the terminal chunk carries usage"),
+            OPENAI_ACCOUNTING,
         );
     }
 
@@ -824,6 +825,7 @@ mod tests {
 
         fixture::assert_accounted_and_billed(
             &last_usage.expect("usage must survive a wire-chunk split mid-line"),
+            OPENAI_ACCOUNTING,
         );
     }
 }

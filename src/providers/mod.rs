@@ -24,6 +24,8 @@ pub mod openai;
 pub mod openai_compat;
 pub mod router;
 pub mod tool_limits;
+#[cfg(test)]
+mod usage_parity;
 
 pub use anthropic::AnthropicAdapter;
 pub use azure::AzureAdapter;

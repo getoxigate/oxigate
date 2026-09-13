@@ -95,6 +95,46 @@ does not price for cache reads — charges cached tokens at 1.0× the tier's inp
 cached quantity priced that way reports a cost status of `rate-fallback`, so a missing discount is
 visible rather than silent; a reported zero has nothing to misprice and does not degrade the status.
 
+### Usage-field audit
+
+Every member of the usage object Google documents for `generateContent` and
+`streamGenerateContent`, and what the gateway does with it. AI Studio and Vertex share one
+projection and one accounting declaration; their schemas differ by one member each.
+
+- **Audited objects:** `UsageMetadata` and the `ModalityTokenCount` it references.
+- **AI Studio (`v1beta`):** discovery document
+  `https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta`, `revision`
+  `20260910`. Google serves only the current revision, so the two schemas were captured at that
+  revision and are identified by the SHA-256
+  `1589a3bf7a5b7863ae0655d36da88be6b95050ff1183188f60843899b7a8531e` of
+  `jq -S '{UsageMetadata: .schemas.UsageMetadata, ModalityTokenCount: .schemas.ModalityTokenCount}'`
+  over the downloaded document.
+- **Vertex (`v1`):** `googleapis/google-api-go-client` @
+  `dfa9e13aa3e07a6283a6497f744ba5c4785a54fc`, `aiplatform/v1/aiplatform-api.json` (discovery
+  `revision` `20260822`), schemas `GoogleCloudAiplatformV1GenerateContentResponseUsageMetadata` and
+  `GoogleCloudAiplatformV1ModalityTokenCount`.
+- Accessed 2026-09-11.
+
+**Not read** means the member plays no part in cost, cost status, the spend row or the budget
+counter.
+
+| Member | `v1beta` | Vertex `v1` | Gateway use |
+|---|---|---|---|
+| `promptTokenCount` | ✓ | ✓ | `prompt_tokens`. Charged at the input rate after `cachedContentTokenCount` is carved out |
+| `cachedContentTokenCount` | ✓ | ✓ | `cache_read_input_tokens`. Charged at the tier's `cache_read_multiplier`, and counted once when the tier is selected |
+| `candidatesTokenCount` | ✓ | ✓ | `completion_tokens`. Charged whole at the output rate |
+| `thoughtsTokenCount` | ✓ | ✓ | `completion_tokens_details.reasoning_tokens`. Charged at the thinking rate **beside** the candidates total |
+| `totalTokenCount` | ✓ | ✓ | `total_tokens`. Reported, not priced |
+| `toolUsePromptTokenCount` | ✓ | ✓ | Not read. `v1beta` describes it as the tokens "present in tool-use prompt(s)"; Vertex as the tokens "in the results from tool executions, which are provided back to the model as input", and lists it in `totalTokenCount` as an addend separate from `promptTokenCount`. An ordinary function result a client sends back — translated to a `functionResponse` part — is such a result, so the member can appear today. Whether Google populates it for function results, whether those tokens are outside `promptTokenCount`, and how they are billed are not established; until they are, the gateway neither charges nor subtracts it |
+| `toolUsePromptTokensDetails[]` | ✓ | ✓ | Not read. The per-modality breakdown of `toolUsePromptTokenCount` |
+| `promptTokensDetails[]` | ✓ | ✓ | Not read. The per-modality breakdown of `promptTokenCount`. Some modalities are priced differently, but the request translation forwards text parts only, so every prompt token it sends is text |
+| `cacheTokensDetails[]` | ✓ | ✓ | Not read. The per-modality breakdown of `cachedContentTokenCount`; text only, for the same reason |
+| `candidatesTokensDetails[]` | ✓ | ✓ | Not read. The per-modality breakdown of `candidatesTokenCount`. No bundled Gemini entry is an image- or audio-output model |
+| `…Details[].modality` | ✓ | ✓ | Not read. `TEXT`, `IMAGE`, `VIDEO`, `AUDIO`, `DOCUMENT` or `MODALITY_UNSPECIFIED` |
+| `…Details[].tokenCount` | ✓ | ✓ | Not read. The count for that modality |
+| `serviceTier` | ✓ | — | Not read. The request translation selects no tier, so a request runs at the default, which the schema describes as standard |
+| `trafficType` | — | ✓ | Not read. Reports how Vertex served the request — on demand, priority, flex, off-peak or provisioned throughput. The adapter selects none of these, and every request is priced at the catalogue's per-token rate; a request served from a provisioned-throughput commitment is priced the same way |
+
 ---
 
 ## Embeddings

@@ -202,6 +202,44 @@ thinking subset twice.
 `X-Oxigate-Output-Tokens` still reports Anthropic's `output_tokens` unchanged; only what is charged
 at the standard output rate is affected.
 
+### Usage-field audit
+
+Every member of the usage objects Anthropic documents for the Messages API, and what the gateway
+does with it.
+
+- **Audited objects:** `Usage` — on the Messages response and on `message_start` — and
+  `MessageDeltaUsage` on `message_delta`, with the nested `CacheCreation`, `OutputTokensDetails` and
+  `ServerToolUsage`. The adapter sends `anthropic-version: 2023-06-01`.
+- **Members:** Anthropic publishes no machine-readable spec, so the member list is read from its
+  Python SDK, `anthropics/anthropic-sdk-python` @ `eb21a4352015686c30f5759e8c2f02d70f5371e2`,
+  `src/anthropic/types/{usage,message_delta_usage,cache_creation,output_tokens_details,server_tool_usage}.py`.
+- **Semantics:** `https://platform.claude.com/docs/en/api/messages` and
+  `https://platform.claude.com/docs/en/build-with-claude/streaming`; the pricing statements below
+  from `https://platform.claude.com/docs/en/about-claude/pricing` and
+  `https://platform.claude.com/docs/en/manage-claude/data-residency`.
+- Accessed 2026-09-11.
+
+**Not read** means the member plays no part in cost, cost status, the spend row or the budget
+counter.
+
+| Member | `Usage` | `MessageDeltaUsage` | Gateway use |
+|---|---|---|---|
+| `input_tokens` | ✓ | ✓ (cumulative) | `prompt_tokens`. Charged whole at the input rate — the cache buckets sit beside it |
+| `output_tokens` | ✓ | ✓ (cumulative) | `completion_tokens`. Charged at the output rate after the thinking subset is carved out |
+| `cache_read_input_tokens` | ✓ | ✓ (cumulative) | `cache_read_input_tokens`. Charged at the tier's `cache_read_multiplier` |
+| `cache_creation_input_tokens` | ✓ | ✓ (cumulative) | The cache-write aggregate. Reconciled against `cache_creation`, never summed with it (see [Reconciling the aggregate against the detail](#reconciling-the-aggregate-against-the-detail)) |
+| `cache_creation.ephemeral_5m_input_tokens` | ✓ | — | A `5m` cache write at the tier's `5m` multiplier |
+| `cache_creation.ephemeral_1h_input_tokens` | ✓ | — | A `1h` cache write at the tier's `1h` multiplier |
+| `output_tokens_details.thinking_tokens` | ✓ | ✓ | `completion_tokens_details.reasoning_tokens`. Charged once at the thinking rate |
+| `server_tool_use.web_search_requests` | ✓ | ✓ | Not read. Web search is charged per search, beside tokens. Not reachable today: the request translation forwards function tools only, so no server tool can be declared through the gateway |
+| `server_tool_use.web_fetch_requests` | ✓ | ✓ | Not read. Web fetch carries no charge beyond the tokens it adds, which are already in `input_tokens`. Not reachable, for the same reason |
+| `service_tier` | ✓ | — | Not read. A `priority` request draws down a Priority Tier capacity commitment instead of being billed at the standard per-token rate the gateway applies to every request. Anthropic no longer sells new commitments |
+| `inference_geo` | ✓ | — | Not read — **a known gap that moves the bill.** US-only inference on Claude 4.6 and later is priced at 1.1× in every token category. The gateway sends no `inference_geo`, so the workspace's `default_inference_geo` decides; where that is `us` — including every workspace migrated from the former US-only opt-out — the gateway's cost and budget figures are 1/1.1 of the bill |
+
+A `cache_creation` member Anthropic adds later in the `ephemeral_<duration>_input_tokens` form is
+accounted as its own class without a code change, as described under
+[Prompt Caching](#prompt-caching).
+
 ---
 
 ## Extended Thinking (Beta)
