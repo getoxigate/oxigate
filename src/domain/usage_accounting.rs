@@ -444,6 +444,9 @@ pub enum WarningReason {
     /// The provider reported no usage at all, so every billing quantity is unreported rather
     /// than zero.
     ProviderUsageMissing,
+    /// The provider stated an inference geography this gateway does not recognise, so no known
+    /// geographic rate could be applied and the request priced at the standard rate.
+    InferenceGeoUnrecognized,
 }
 
 impl WarningReason {
@@ -459,6 +462,7 @@ impl WarningReason {
             Self::ReasoningExceedsCompletion => "reasoning-exceeds-completion",
             Self::IncompleteEvidence => "incomplete-evidence",
             Self::ProviderUsageMissing => "provider-usage-missing",
+            Self::InferenceGeoUnrecognized => "inference-geo-unrecognized",
         }
     }
 }

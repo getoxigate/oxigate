@@ -12,9 +12,9 @@ use serde_json;
 use tracing::{debug, warn};
 
 use crate::domain::chat::{
-    CacheAccounting, ChatRequest, ChatResponse, Choice, CompletionTokensDetails, Message,
-    MessageContent, ReasoningAccounting, Role, StreamChunk, ToolCall, ToolCallFunction, Usage,
-    UsageAccounting,
+    CacheAccounting, ChatRequest, ChatResponse, Choice, CompletionTokensDetails, InferenceGeo,
+    Message, MessageContent, ReasoningAccounting, Role, StreamChunk, ToolCall, ToolCallFunction,
+    Usage, UsageAccounting,
 };
 use crate::domain::ports::ProviderError;
 use crate::domain::tool_schema::{ERR_TOOL_CALL_BUFFER_OVERFLOW, ERR_TYPE_GATEWAY_ERROR};
@@ -517,6 +517,10 @@ struct AnthropicUsageState {
     /// from being attributed to the default class on top of details already credited.
     cache_write_details_seen: bool,
     reasoning_tokens: Option<u64>,
+    /// Where the provider stated inference ran, from the buffered `usage` object or from
+    /// `message_start`. A `message_delta` that states a geography replaces it; one that omits the
+    /// member leaves it standing.
+    inference_geo: InferenceGeo,
 }
 
 impl AnthropicUsageState {
@@ -530,6 +534,7 @@ impl AnthropicUsageState {
             cache_write: CacheWriteAccumulator::new(registry),
             cache_write_details_seen: false,
             reasoning_tokens: None,
+            inference_geo: InferenceGeo::Unstated,
         }
     }
 
@@ -555,6 +560,7 @@ impl AnthropicUsageState {
                     .as_ref()
                     .and_then(|d| d.thinking_tokens)
             }),
+            inference_geo: u.inference_geo,
         }
     }
 
@@ -589,6 +595,7 @@ impl AnthropicUsageState {
             cache_read_input_tokens: self.cache_read_input_tokens,
             prompt_tokens_details: None,
             accounting,
+            inference_geo: self.inference_geo,
             image_units: None,
             audio_seconds: None,
             cache_write,
@@ -704,6 +711,9 @@ impl StreamTranslator {
                     // here. An aggregate that disagrees with the details is legal input and
                     // reconciles at finalization rather than being asserted away.
                     self.usage.cache_write_details_seen |= u.cache_creation_present;
+                    // The opening statement of the geography. A later `message_delta` replaces it
+                    // only when that event states one of its own.
+                    self.usage.inference_geo = u.inference_geo;
                 }
                 Ok(None)
             }
@@ -876,6 +886,9 @@ impl StreamTranslator {
                 self.usage.cache_write_details_seen |= u.cache_creation_present;
                 if let Some(ref d) = u.output_tokens_details {
                     self.usage.reasoning_tokens = d.thinking_tokens.or(self.usage.reasoning_tokens);
+                }
+                if u.inference_geo != InferenceGeo::Unstated {
+                    self.usage.inference_geo = u.inference_geo;
                 }
                 let usage = self.build_usage();
                 let finish_reason = map_stop_reason(delta.stop_reason.as_deref());
@@ -1076,6 +1089,7 @@ mod tests {
         AnthropicUsage, ContentBlock, MessagesResponse, MessagesResponseSeed, OutputTokensDetails,
     };
     use crate::providers::usage_parity::assert_usage_parity;
+    use tracing_test::traced_test;
 
     /// Parses a buffered response body exactly as the adapter does — seeded, so the cache-write
     /// detail object reaches the accumulator instead of an intermediate that would flatten it.
@@ -1508,6 +1522,7 @@ mod tests {
                 output_tokens_details: None,
                 cache_creation_present: false,
                 input_tokens_present: true,
+                inference_geo: InferenceGeo::Unstated,
             },
         };
         let chat = anthropic_to_chat_response(
@@ -1960,6 +1975,7 @@ mod tests {
                 }),
                 cache_creation_present: false,
                 input_tokens_present: true,
+                inference_geo: InferenceGeo::Unstated,
             },
         };
         let chat = anthropic_to_chat_response(
@@ -2005,6 +2021,7 @@ mod tests {
                 }),
                 cache_creation_present: false,
                 input_tokens_present: true,
+                inference_geo: InferenceGeo::Unstated,
             },
         };
         let chat = anthropic_to_chat_response(
@@ -2706,6 +2723,23 @@ mod tests {
             delta: r#"{"output_tokens":2000,"output_tokens_details":{"thinking_tokens":1500}}"#,
         },
         ParityCase {
+            // The terminal `message_delta` deliberately omits the member, because the wire does:
+            // only the buffered `usage` object and `message_start` state a geography. A streamed
+            // projection that rebuilt geo from the terminal event would lose it here.
+            name: "inference geo stated once, on the opening event",
+            buffered: r#"{"input_tokens":100,"output_tokens":20,"inference_geo":"us"}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0,"inference_geo":"us"}"#,
+            delta: r#"{"output_tokens":20}"#,
+        },
+        ParityCase {
+            // Keep-unless-stated, like every other member of the terminal event: a geography
+            // first stated on `message_delta` must still reach the streamed projection.
+            name: "inference geo stated only on the terminal event",
+            buffered: r#"{"input_tokens":100,"output_tokens":20,"inference_geo":"us"}"#,
+            start: r#"{"input_tokens":100,"output_tokens":0}"#,
+            delta: r#"{"output_tokens":20,"inference_geo":"us"}"#,
+        },
+        ParityCase {
             name: "aggregate restated on the terminal event after details were seen",
             buffered: r#"{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":3500,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
             start: r#"{"input_tokens":100,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2500}}"#,
@@ -3014,6 +3048,155 @@ mod tests {
         );
         assert_eq!(usage.prompt_tokens, 8);
         assert_eq!(usage.total_tokens, 24);
+        // The capture is a pre-4.6 model, for which `not_available` is the documented value and
+        // the standard rate is correct. Asserted here rather than only against a synthetic
+        // fixture, because this is the one payload in the tree that Anthropic actually sent.
+        assert_eq!(usage.inference_geo, InferenceGeo::NotAvailable);
+    }
+
+    /// Every value Anthropic documents for `usage.inference_geo`, plus the two shapes that state
+    /// none and the two that state something unrecognised, resolved on both paths.
+    ///
+    /// Anthropic documents exactly three values — `global`, `us`, and `not_available` for a model
+    /// without geographic pinning
+    /// (`platform.claude.com/docs/en/manage-claude/usage-cost-api` §Data residency, accessed
+    /// 2026-09-17). Absent and `null` state nothing, which is not the same as stating a
+    /// geography this build has no rate for: the first is every payload that predates the
+    /// member, the second is a signal that the rate is undetermined.
+    #[test]
+    fn test_inference_geo_resolves_every_wire_value_on_both_paths() {
+        // (member fragment to splice into the usage object, expected value, what it stands for)
+        let cases: &[(&str, InferenceGeo, &str)] = &[
+            (r#","inference_geo":"us""#, InferenceGeo::Us, "US-only"),
+            (
+                r#","inference_geo":"global""#,
+                InferenceGeo::Global,
+                "global routing",
+            ),
+            (
+                r#","inference_geo":"not_available""#,
+                InferenceGeo::NotAvailable,
+                "a model without geographic pinning",
+            ),
+            ("", InferenceGeo::Unstated, "the member absent"),
+            (
+                r#","inference_geo":null"#,
+                InferenceGeo::Unstated,
+                "an explicit null",
+            ),
+            (
+                r#","inference_geo":"eu""#,
+                InferenceGeo::Other,
+                "a geography added after this build",
+            ),
+            (
+                r#","inference_geo":"""#,
+                InferenceGeo::Other,
+                "an empty string",
+            ),
+        ];
+
+        for (member, expected, what) in cases {
+            let buffered = buffered_usage(
+                &buffered_body(&format!(
+                    r#"{{"input_tokens":100,"output_tokens":20{member}}}"#
+                )),
+                &bundled_pricing_context(),
+            );
+            assert_eq!(
+                buffered.inference_geo, *expected,
+                "buffered: {what} must resolve to {expected:?}"
+            );
+
+            let mut tr = StreamTranslator::new(
+                "claude-sonnet-4-5-20251022".into(),
+                "rid".into(),
+                usize::MAX,
+                bundled_pricing_context(),
+            );
+            feed(
+                &mut tr,
+                &format!(
+                    r#"{{"type":"message_start","message":{{"id":"m1","type":"message","role":"assistant","usage":{{"input_tokens":100,"output_tokens":0{member}}}}}}}"#
+                ),
+            );
+            feed(
+                &mut tr,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}"#,
+            );
+            let streamed = tr.build_usage();
+            assert_eq!(
+                streamed.inference_geo, *expected,
+                "streamed: {what} must resolve to {expected:?}"
+            );
+
+            assert_usage_parity(&buffered, &streamed, what);
+        }
+    }
+
+    /// A usage object stating `inference_geo` twice is rejected, like every other duplicated
+    /// member. Adding the name to the field list is what buys this — `SeenFields::mark` does the
+    /// work, so the point of the test is that the member was registered rather than matched by
+    /// the ignore-everything-else arm, where a duplicate would pass unnoticed.
+    #[test]
+    fn test_duplicate_inference_geo_is_rejected() {
+        let error = buffered_parse_error(&buffered_body(
+            r#"{"input_tokens":100,"output_tokens":20,"inference_geo":"us","inference_geo":"global"}"#,
+        ));
+        assert!(
+            error.contains("inference_geo"),
+            "the rejection must name the duplicated member, got: {error}"
+        );
+    }
+
+    /// The unrecognised geography is recoverable from the logs, length-capped.
+    ///
+    /// The reason code on the structured warning says *that* a geography was unrecognised; it
+    /// deliberately cannot say which, because no provider-supplied text may reach `WarningFacts`.
+    /// That leaves an operator unable to act on the one warning meant to be acted on, so the value
+    /// is logged once at DEBUG where the bounded-warning rule does not apply, then discarded.
+    #[traced_test]
+    #[test]
+    fn test_unrecognized_inference_geo_is_recoverable_from_the_logs() {
+        let usage = buffered_usage(
+            &buffered_body(r#"{"input_tokens":100,"output_tokens":20,"inference_geo":"eu-west"}"#),
+            &bundled_pricing_context(),
+        );
+        assert_eq!(usage.inference_geo, InferenceGeo::Other);
+        assert!(
+            logs_contain("eu-west"),
+            "the operator must be able to learn which geography arrived"
+        );
+
+        // Bounded: a pathological value is capped rather than logged whole.
+        let long = "z".repeat(4_000);
+        let usage = buffered_usage(
+            &buffered_body(&format!(
+                r#"{{"input_tokens":100,"output_tokens":20,"inference_geo":"{long}"}}"#
+            )),
+            &bundled_pricing_context(),
+        );
+        assert_eq!(usage.inference_geo, InferenceGeo::Other);
+        assert!(
+            !logs_contain(&long),
+            "the untrimmed provider value must never reach the log"
+        );
+    }
+
+    /// A non-string `inference_geo` keeps the parser's ordinary type rejection.
+    ///
+    /// Deliberately not folded into the `Other` arm: tolerating a wrong JSON type here alone
+    /// would mean custom deserialization for one member, and an inconsistency with
+    /// `input_tokens` and the rest of the usage object.
+    #[test]
+    fn test_non_string_inference_geo_is_rejected() {
+        let error = buffered_parse_error(&buffered_body(
+            r#"{"input_tokens":100,"output_tokens":20,"inference_geo":7}"#,
+        ));
+        assert!(
+            error.contains("string"),
+            "the rejection must be an ordinary type error, got: {error}"
+        );
     }
 
     /// A translator with no `message_start` behind it, for the usage-shape cases.
@@ -3511,6 +3694,7 @@ mod tests {
                 output_tokens_details: None,
                 cache_creation_present: false,
                 input_tokens_present: true,
+                inference_geo: InferenceGeo::Unstated,
             },
         };
         let err = anthropic_to_chat_response(
@@ -3557,6 +3741,7 @@ mod tests {
                 output_tokens_details: None,
                 cache_creation_present: false,
                 input_tokens_present: true,
+                inference_geo: InferenceGeo::Unstated,
             },
         };
         // "{}" is 2 bytes; cap of 2 means len == cap, which is NOT > cap, so must be Ok.

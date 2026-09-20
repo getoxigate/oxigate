@@ -101,9 +101,9 @@ where
                 .cloned()
                 .unwrap_or_default();
 
-            // Step 3: Read identity spend. BudgetLayer (earlier in the Pro stack) already read
-            // this key and stored the result in BudgetCheckResult — reuse it to avoid a second
-            // Redis GET for the same key. Fall back to Redis only if absent.
+            // Step 3: Read identity spend. BudgetLayer (earlier in the middleware stack)
+            // already read this key and stored the result in BudgetCheckResult — reuse it to
+            // avoid a second Redis GET for the same key. Fall back to Redis only if absent.
             let spend_nano_usd = if let Some(r) = req.extensions().get::<BudgetCheckResult>() {
                 r.spend_nano_usd
             } else {

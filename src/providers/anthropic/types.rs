@@ -8,10 +8,12 @@ use std::fmt;
 
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use tracing::debug;
 
+use crate::domain::chat::InferenceGeo;
 use crate::domain::usage_accounting::{
     CacheWriteAccumulator, CacheWriteClass, CacheWriteClassRegistry, CacheWriteDetailsSeed,
-    CacheWriteKeyGrammar,
+    CacheWriteKeyGrammar, MAX_RAW_KEY_BYTES,
 };
 
 /// Anthropic Messages API request body.
@@ -138,6 +140,14 @@ pub struct AnthropicUsage {
     /// this records the difference so that nothing ever bills the fabrication.
     #[serde(skip)]
     pub input_tokens_present: bool,
+    /// Where Anthropic stated inference ran, resolved from `usage.inference_geo`.
+    ///
+    /// Absent and explicit `null` both resolve to [`InferenceGeo::Unstated`], which prices at the
+    /// standard rate — the member is simply not part of what that payload stated. A string
+    /// Anthropic has not documented resolves to [`InferenceGeo::Other`], which also prices at the
+    /// standard rate but records that no rate was established for it.
+    #[serde(skip)]
+    pub inference_geo: InferenceGeo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,7 +479,41 @@ const USAGE_FIELDS: &[&str] = &[
     "cache_read_input_tokens",
     "output_tokens_details",
     "cache_creation",
+    "inference_geo",
 ];
+
+/// Resolves Anthropic's `usage.inference_geo` string into the domain value.
+///
+/// Anthropic documents exactly three values for this member: `global`, `us`, and
+/// `not_available` for a model that does not support geographic pinning
+/// (`https://platform.claude.com/docs/en/manage-claude/usage-cost-api` §Data residency, accessed
+/// 2026-09-17). Anything else is a geography this gateway has no rate for, and it is treated as
+/// such rather than quietly billed at the standard rate — which is the failure mode that made
+/// the surcharge invisible in the first place. An empty string takes that same arm.
+///
+/// The unrecognised value is logged once at DEBUG, length-capped, and then dropped. It cannot ride
+/// the domain enum — that would make it non-`Copy` and put provider text on a path toward
+/// `WarningFacts`, which carries only bounded gateway-authored content — but the reason code alone
+/// tells an operator that *some* geography was unrecognised without telling them which, on the one
+/// warning that exists to be acted on. The cap mirrors [`MAX_RAW_KEY_BYTES`], the bound this crate
+/// already applies to provider-supplied member names it retains, counted in characters so the
+/// slice can never split one.
+fn inference_geo_from_wire(value: &str) -> InferenceGeo {
+    match value {
+        "us" => InferenceGeo::Us,
+        "global" => InferenceGeo::Global,
+        "not_available" => InferenceGeo::NotAvailable,
+        _ => {
+            // Allocates only on this arm, which a conforming provider never takes.
+            let shown: String = value.chars().take(MAX_RAW_KEY_BYTES).collect();
+            debug!(
+                inference_geo = shown,
+                "anthropic reported an unrecognised inference_geo; pricing at the standard rate"
+            );
+            InferenceGeo::Other
+        }
+    }
+}
 
 impl<'de> DeserializeSeed<'de> for AnthropicUsageSeed<'_> {
     type Value = AnthropicUsage;
@@ -513,6 +557,16 @@ impl<'de> Visitor<'de> for AnthropicUsageSeed<'_> {
                         map.next_value_seed(CacheCreationMemberSeed {
                             candidate: self.candidate.reborrow(),
                         })?;
+                }
+                // `Option<String>` rather than a tolerant custom visitor: an explicit `null` is
+                // as unstated as an absent member, while a non-string value keeps this parser's
+                // ordinary rejection. Accepting a wrong JSON type here alone would be an
+                // inconsistency with `input_tokens` and every other member of this object.
+                Some(6) => {
+                    usage.inference_geo = map
+                        .next_value::<Option<String>>()?
+                        .as_deref()
+                        .map_or(InferenceGeo::Unstated, inference_geo_from_wire);
                 }
                 _ => {
                     map.next_value::<IgnoredAny>()?;

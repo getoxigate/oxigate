@@ -18,7 +18,9 @@ use bytes::Bytes;
 use futures::Stream;
 use thiserror::Error;
 
-use crate::domain::chat::{ChatRequest, ChatResponse, ReasoningAccounting, StreamChunk};
+use crate::domain::chat::{
+    ChatRequest, ChatResponse, InferenceGeo, ReasoningAccounting, StreamChunk,
+};
 use crate::domain::embedding::{EmbeddingRequest, EmbeddingResponse};
 use crate::domain::usage_accounting::{CacheWriteAccounting, CostStatus};
 
@@ -172,6 +174,11 @@ pub struct TokenUsage {
     /// Defaults to `Additive`, under which `output_tokens` is charged whole — the behaviour of
     /// every caller that constructs this type with `..Default::default()`.
     pub reasoning_accounting: ReasoningAccounting,
+    /// Where the provider stated inference ran, when it stated anything.
+    ///
+    /// Defaults to [`InferenceGeo::Unstated`], which applies no multiplier and moves no status,
+    /// so a caller that never sets it prices exactly as it did before.
+    pub inference_geo: InferenceGeo,
 }
 
 impl TokenUsage {

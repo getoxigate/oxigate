@@ -15,6 +15,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::config::PricingConfig;
+use crate::domain::chat::InferenceGeo;
 use crate::domain::ports::{CostBreakdown, CostCalculator, CostError, NanoUsd, TokenUsage};
 use crate::domain::usage_accounting::{
     CacheWriteClass, CacheWriteClassRegistry, ClassRegistryError, CostStatus, PricingContext,
@@ -683,15 +684,40 @@ fn priced_component(tokens: u64, rate_nano: u64, mult_1e9: u64) -> Result<NanoUs
         .map_err(|_| CostError::Pricing("cost component not representable in nano-USD".to_string()))
 }
 
+/// The provider whose catalogue entries carry a geographic inference surcharge.
+const GEO_SURCHARGE_PROVIDER: &str = "anthropic";
+
+/// Surcharge applied to US-only inference on [`GEO_SURCHARGE_PROVIDER`], at 1e9 fixed point.
+///
+/// A code constant rather than a per-tier field in the bundled asset, for two reasons. The asset
+/// is imported from its source and never hand-authored, and the upstream dataset carries no geo
+/// multiplier — five hand-added values would be dropped by the next refresh. And model is the
+/// wrong key anyway: the surcharge is a property of *where a request ran*, which varies per
+/// request on the same model. Eligibility needs no catalogue marker either, because the wire
+/// value carries it — a model without geographic pinning reports `not_available` rather than `us`
+/// or `global`.
+///
+/// Source: `https://platform.claude.com/docs/en/manage-claude/data-residency` §Pricing and
+/// `https://platform.claude.com/docs/en/about-claude/pricing` §Data residency pricing — US-only
+/// inference on Claude 4.6 and later is priced at 1.1x "across all token pricing categories
+/// (input tokens, output tokens, cache writes, and cache reads)". Accessed 2026-09-17.
+const US_INFERENCE_MULTIPLIER_1E9: u64 = 1_100_000_000;
+
 /// Scales an already-computed cost by a dimensionless multiplier at 1e9 fixed point — the batch
-/// discount application. Checked the same way as [`priced_component`].
+/// discount and the geographic surcharge. Checked the same way as [`priced_component`].
+///
+/// Truncating, like every other step: the quotient is floored, so a cost that passes through two
+/// of these passes truncates twice. That is the documented rule the oracles in the tests are
+/// computed under, not an approximation of one exact ratio.
 fn apply_multiplier(cost: NanoUsd, mult_1e9: u64) -> Result<NanoUsd, CostError> {
     let product = (cost.0 as u128)
         .checked_mul(mult_1e9 as u128)
-        .ok_or_else(|| CostError::Pricing("batch discount overflowed u128".to_string()))?;
+        .ok_or_else(|| CostError::Pricing("cost multiplier overflowed u128".to_string()))?;
     u64::try_from(product / 1_000_000_000u128)
         .map(NanoUsd)
-        .map_err(|_| CostError::Pricing("batch discount not representable in nano-USD".to_string()))
+        .map_err(|_| {
+            CostError::Pricing("multiplied cost not representable in nano-USD".to_string())
+        })
 }
 
 /// Checked sum of every cost component. Deliberately not the `NanoUsd: Add` operator
@@ -895,6 +921,55 @@ impl CostCalculator for BundledCostCalculator {
                     audio_cost = apply_multiplier(audio_cost, batch_out)?;
                 }
 
+                // Geographic surcharge, last before the sum. The provider states it stacks with
+                // the cache and batch modifiers, so it scales their results rather than the raw
+                // rates — and each pass truncates, exactly as the batch pass already truncates
+                // after the cache passes.
+                //
+                // It reaches the five *token-category* components only. Image units and audio
+                // seconds are not token categories and the provider's statement does not reach
+                // them; that they are zero in today's Anthropic catalogue is not what makes the
+                // exclusion right, and would stop being true for the first multimodal entry.
+                //
+                // The match is on what the response *stated*, not on the entry's provider. The
+                // provider label decides only whether a known surcharge can be applied; it never
+                // decides whether an unpriced geography may be billed as though it were priced.
+                // Splitting those two questions is what stops the surcharge going silent on an
+                // entry whose label is not `anthropic` — which `pricing.overrides` produces
+                // routinely, since `apply_override` inherits `provider` only when the override
+                // key already names a catalogue entry and otherwise stamps `"override"`.
+                match usage.inference_geo {
+                    // Nothing was stated. Every non-Anthropic lane and every pre-parse path
+                    // carries this, so it has to stay completely inert: no multiplier, no status
+                    // change, no warning.
+                    InferenceGeo::Unstated => {}
+                    // Standard pricing, stated as such by the provider. True of any entry at any
+                    // rate, so no provider gate applies.
+                    InferenceGeo::Global | InferenceGeo::NotAvailable => {}
+                    // A recognised surcharge against an entry that publishes it.
+                    InferenceGeo::Us if e.provider == GEO_SURCHARGE_PROVIDER => {
+                        input_cost = apply_multiplier(input_cost, US_INFERENCE_MULTIPLIER_1E9)?;
+                        output_cost = apply_multiplier(output_cost, US_INFERENCE_MULTIPLIER_1E9)?;
+                        cached_input_cost =
+                            apply_multiplier(cached_input_cost, US_INFERENCE_MULTIPLIER_1E9)?;
+                        cache_write_cost =
+                            apply_multiplier(cache_write_cost, US_INFERENCE_MULTIPLIER_1E9)?;
+                        thinking_cost =
+                            apply_multiplier(thinking_cost, US_INFERENCE_MULTIPLIER_1E9)?;
+                    }
+                    // A geography was stated and this entry carries no rate for it: `us` against
+                    // an entry not labelled with the publishing provider, or a string this build
+                    // does not recognise at all. 1.0 is the only defensible amount in both cases
+                    // — but claiming `Exact` while billing it is the fail-open under-count this
+                    // story exists to remove, found the same slow way, off a bill months later.
+                    // Every other unpriceable dimension here already refuses that: the batch pass
+                    // degrades on a missing multiplier, and image and audio fail the request
+                    // outright.
+                    InferenceGeo::Us | InferenceGeo::Other => {
+                        status = status.worst(CostStatus::RateFallback);
+                    }
+                }
+
                 let total_cost = checked_total([
                     input_cost,
                     output_cost,
@@ -1078,6 +1153,384 @@ mod tests {
     fn tiered_fixture_calc() -> BundledCostCalculator {
         let db = PricingDb::load(TIERED_FIXTURE.as_bytes(), &default_config()).unwrap();
         BundledCostCalculator::new(db_holder(db))
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Geographic inference surcharge
+    // ---------------------------------------------------------------------------------------
+
+    /// Two entries at byte-identical rates, differing only in `provider`.
+    ///
+    /// The surcharge is gated on the provider that publishes it, so a fixture declaring
+    /// `"provider":"test"` — as the shared parity fixture does — would let every geo assertion
+    /// pass with the surcharge never applied. The control entry is what turns that gate into
+    /// something a test can actually observe: identical rates, identical usage, and the only
+    /// difference in the result has to come from the provider.
+    ///
+    /// Rates are deliberately awkward per-token values rather than round ones, so the truncating
+    /// fixed-point rule is exercised rather than stepped over. `image_per_unit` and
+    /// `audio_per_second` are configured because the exclusion of those two components is an
+    /// assertion here, and an unconfigured rate with positive usage fails the request instead.
+    const GEO_FIXTURE: &str = r#"{"models":{
+        "geo-fixture-anthropic":{
+          "provider":"anthropic","context_window":1000000,"aliases":[],
+          "tiers":[
+            {"threshold":0,"input_per_token":0.000000123,"output_per_token":0.000000457,
+             "cache_read_multiplier":0.3,"cache_write_multipliers":{"5m":1.4,"1h":2.6},
+             "thinking_per_token":0.000000911,"image_per_unit":0.0000071,
+             "audio_per_second":0.000313,
+             "batch_input_multiplier":0.5,"batch_output_multiplier":0.5}
+          ]},
+        "geo-fixture-control":{
+          "provider":"other-vendor","context_window":1000000,"aliases":[],
+          "tiers":[
+            {"threshold":0,"input_per_token":0.000000123,"output_per_token":0.000000457,
+             "cache_read_multiplier":0.3,"cache_write_multipliers":{"5m":1.4,"1h":2.6},
+             "thinking_per_token":0.000000911,"image_per_unit":0.0000071,
+             "audio_per_second":0.000313,
+             "batch_input_multiplier":0.5,"batch_output_multiplier":0.5}
+          ]}}}"#;
+
+    const GEO_MODEL: &str = "geo-fixture-anthropic";
+    const GEO_CONTROL_MODEL: &str = "geo-fixture-control";
+
+    fn geo_fixture_calc() -> BundledCostCalculator {
+        let db = PricingDb::load(GEO_FIXTURE.as_bytes(), &default_config()).unwrap();
+        BundledCostCalculator::new(db_holder(db))
+    }
+
+    /// One usage shape with every priced component positive, so a surcharge that missed one
+    /// component — or reached one it must not — shows as a component difference rather than
+    /// hiding inside a matching total.
+    fn geo_usage(inference_geo: InferenceGeo, batch: bool) -> TokenUsage {
+        TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_input_tokens: 300,
+            cache_write: cache_write_of(&[("5m", 100), ("1h", 50)]),
+            thinking_tokens: 200,
+            image_count: 2,
+            audio_seconds: 3.0,
+            batch,
+            inference_geo,
+            ..Default::default()
+        }
+    }
+
+    /// Every component of one breakdown, named, for a component-by-component assertion.
+    fn components(b: &CostBreakdown) -> [(&'static str, u64); 7] {
+        [
+            ("input", b.input_cost.0),
+            ("output", b.output_cost.0),
+            ("cached_input", b.cached_input_cost.0),
+            ("cache_write", b.cache_write_cost.0),
+            ("thinking", b.thinking_cost.0),
+            ("image", b.image_cost.0),
+            ("audio", b.audio_cost.0),
+        ]
+    }
+
+    /// `us` bills the hand-computed integer oracle, component by component.
+    ///
+    /// Oracle, under the documented truncating rule (`cost × 1_100_000_000 / 1_000_000_000` in
+    /// `u128`, floored) applied to the five token-category components only:
+    ///
+    /// | Component | Standard | × 1.1 |
+    /// |---|---|---|
+    /// | input | 1,000 × 123 = 123,000 | 135,300 |
+    /// | output | 500 × 457 = 228,500 | 251,350 |
+    /// | cache read | 300 × 123 × 0.3 = 11,070 | 12,177 |
+    /// | cache write | 100 × 123 × 1.4 + 50 × 123 × 2.6 = 33,210 | 36,531 |
+    /// | thinking | 200 × 911 = 182,200 | 200,420 |
+    /// | image | 2 × 7,100 = 14,200 | **14,200 — excluded** |
+    /// | audio | 3.0 × 313,000 = 939,000 | **939,000 — excluded** |
+    ///
+    /// Total 1,588,978 nano-USD against a standard 1,531,180.
+    #[test]
+    fn geo_us_bills_the_surcharge_on_every_token_category() {
+        let calc = geo_fixture_calc();
+        let cost = calc
+            .calculate(GEO_MODEL, &geo_usage(InferenceGeo::Us, false))
+            .expect("the fixture prices");
+
+        assert_eq!(
+            components(&cost),
+            [
+                ("input", 135_300),
+                ("output", 251_350),
+                ("cached_input", 12_177),
+                ("cache_write", 36_531),
+                ("thinking", 200_420),
+                ("image", 14_200),
+                ("audio", 939_000),
+            ],
+            "each token-category component carries 1.1x and the two modality components do not"
+        );
+        assert_eq!(cost.total_cost.0, 1_588_978);
+        assert_eq!(
+            cost.status,
+            CostStatus::Exact,
+            "a recognised geography priced at a known rate establishes full confidence"
+        );
+    }
+
+    /// The modality components are byte-identical between `us` and `global`.
+    ///
+    /// Stated as its own test rather than left to the oracle above, because the oracle would
+    /// still pass if image and audio were scaled *and* the expected values were scaled with
+    /// them. This one cannot: it compares two runs of the same code.
+    #[test]
+    fn geo_does_not_scale_image_or_audio() {
+        let calc = geo_fixture_calc();
+        let us = calc
+            .calculate(GEO_MODEL, &geo_usage(InferenceGeo::Us, false))
+            .expect("prices");
+        let global = calc
+            .calculate(GEO_MODEL, &geo_usage(InferenceGeo::Global, false))
+            .expect("prices");
+
+        assert_eq!(
+            us.image_cost, global.image_cost,
+            "image units are not tokens"
+        );
+        assert_eq!(
+            us.audio_cost, global.audio_cost,
+            "audio seconds are not tokens"
+        );
+        assert!(
+            us.total_cost > global.total_cost,
+            "the token categories still moved, so this is not passing by scaling nothing"
+        );
+    }
+
+    /// The surcharge composes with the batch discount, in the documented order and under the
+    /// documented truncation.
+    ///
+    /// Batch runs first (0.5x on every component), geo second (1.1x on the five token
+    /// categories), and each pass floors independently. Two components make the double
+    /// truncation visible: cache read 11,070 → 5,535 → 6,088 (not 6,088.5) and cache write
+    /// 33,210 → 16,605 → 18,265 (not 18,265.5). Asserting a 1.1 *ratio* against the unbatched
+    /// result would be wrong by those halves.
+    #[test]
+    fn geo_composes_with_the_batch_discount_and_truncates_twice() {
+        let calc = geo_fixture_calc();
+        let cost = calc
+            .calculate(GEO_MODEL, &geo_usage(InferenceGeo::Us, true))
+            .expect("prices");
+
+        assert_eq!(
+            components(&cost),
+            [
+                ("input", 67_650),
+                ("output", 125_675),
+                ("cached_input", 6_088),
+                ("cache_write", 18_265),
+                ("thinking", 100_210),
+                ("image", 7_100),
+                ("audio", 469_500),
+            ]
+        );
+        assert_eq!(cost.total_cost.0, 794_488);
+    }
+
+    /// The three benign values price identically to each other and change no status.
+    ///
+    /// `NotAvailable` is the value a model without geographic pinning reports, and such a model
+    /// is billed at the standard rate — so this also covers the pre-4.6 case, where reporting
+    /// `exact` is correct rather than a missed surcharge.
+    #[test]
+    fn geo_benign_values_change_neither_cost_nor_status() {
+        let calc = geo_fixture_calc();
+        let baseline = calc
+            .calculate(GEO_MODEL, &geo_usage(InferenceGeo::Unstated, false))
+            .expect("prices");
+        assert_eq!(baseline.total_cost.0, 1_531_180);
+        assert_eq!(baseline.status, CostStatus::Exact);
+
+        for geo in [InferenceGeo::Global, InferenceGeo::NotAvailable] {
+            let cost = calc
+                .calculate(GEO_MODEL, &geo_usage(geo, false))
+                .expect("prices");
+            assert_eq!(
+                components(&cost),
+                components(&baseline),
+                "{geo:?} must price exactly as an unstated geography does"
+            );
+            assert_eq!(cost.status, CostStatus::Exact, "{geo:?} must stay exact");
+        }
+    }
+
+    /// An unrecognised geography prices at the standard rate and says the rate was not
+    /// established.
+    ///
+    /// Both halves matter. Pricing at 1.0 is the only defensible choice — the gateway has no
+    /// rate for a geography it does not know. Reporting `exact` while doing so is this defect
+    /// repeating itself, so the status has to move.
+    #[test]
+    fn geo_other_prices_at_the_standard_rate_and_degrades_status() {
+        let calc = geo_fixture_calc();
+        let baseline = calc
+            .calculate(GEO_MODEL, &geo_usage(InferenceGeo::Unstated, false))
+            .expect("prices");
+        let other = calc
+            .calculate(GEO_MODEL, &geo_usage(InferenceGeo::Other, false))
+            .expect("prices");
+
+        assert_eq!(
+            components(&other),
+            components(&baseline),
+            "no known surcharge can be applied, so no surcharge is applied"
+        );
+        assert_eq!(
+            other.status,
+            CostStatus::RateFallback,
+            "an unpriced geography cannot be billed at exact confidence"
+        );
+    }
+
+    /// A stated geography the priced entry has no rate for degrades status instead of billing
+    /// short in silence — including on an entry a `pricing.overrides` config created.
+    ///
+    /// [`apply_override`] inherits `provider` only when the override key already names an entry in
+    /// the catalogue; otherwise it stamps `"override"`. Two ordinary operator actions reach that:
+    /// pricing a Claude model released since the last asset refresh, and keying an override on an
+    /// alias — [`PricingDbInner::resolve_by_canonical_or_alias`] consults `by_canonical` first, so
+    /// the new entry shadows the correctly-labelled one. A provider-gated surcharge alone would
+    /// bill both at 1.0 and report `Exact`, which is the defect this story removes, reappearing
+    /// through config.
+    ///
+    /// Charging 1.0 is still the only defensible amount — there is no rate to apply. What must not
+    /// happen is claiming full confidence in it, which is also what every other unpriceable
+    /// dimension in `calculate` already refuses to do.
+    #[test]
+    fn geo_stated_without_a_rate_degrades_rather_than_billing_short() {
+        // An override for a model absent from the bundled asset: the entry it creates carries
+        // `provider: "override"`, not `anthropic`.
+        let mut config = default_config();
+        config.overrides.insert(
+            "claude-opus-4-7".into(),
+            PricingOverride {
+                input_per_token: 0.000005,
+                output_per_token: 0.000025,
+                context_window: 1_000_000,
+                cache_read_multiplier: None,
+                cache_write_multipliers: HashMap::new(),
+            },
+        );
+        // An override keyed on an existing Anthropic *alias*, which creates a fresh canonical
+        // entry that shadows `claude-sonnet-4-6`.
+        config.overrides.insert(
+            "claude-sonnet-4".into(),
+            PricingOverride {
+                input_per_token: 0.000003,
+                output_per_token: 0.000015,
+                context_window: 1_000_000,
+                cache_read_multiplier: None,
+                cache_write_multipliers: HashMap::new(),
+            },
+        );
+        let db = PricingDb::load(BUNDLED_PRICING_JSON, &config).unwrap();
+        let calc = BundledCostCalculator::new(db_holder(db));
+
+        // `Other` is covered beside `Us` because the two predicates that read this axis have to
+        // agree: `calculate` degrades status, and the `WarningFacts` assembly in `cost_headers`
+        // raises `InferenceGeoUnrecognized` on `Other` without consulting the provider at all. A
+        // provider-gated status would let an override entry emit that reason next to a
+        // `cost-status: exact` header, contradicting the published provider doc.
+        for (model, geo) in [
+            ("claude-opus-4-7", InferenceGeo::Us),
+            ("claude-opus-4-7", InferenceGeo::Other),
+            ("claude-sonnet-4", InferenceGeo::Us),
+            ("claude-sonnet-4", InferenceGeo::Other),
+        ] {
+            let usage = TokenUsage {
+                input_tokens: 1_000,
+                output_tokens: 500,
+                inference_geo: geo,
+                ..Default::default()
+            };
+            let cost = calc.calculate(model, &usage).expect("the override prices");
+            assert_eq!(
+                cost.status,
+                CostStatus::RateFallback,
+                "{model}/{geo:?}: a stated geography priced against an entry with no geo rate \
+                 must not report exact confidence"
+            );
+
+            let unstated = calc
+                .calculate(
+                    model,
+                    &TokenUsage {
+                        inference_geo: InferenceGeo::Unstated,
+                        ..usage.clone()
+                    },
+                )
+                .expect("prices");
+            assert_eq!(
+                cost.total_cost, unstated.total_cost,
+                "{model}/{geo:?}: with no rate to apply, 1.0 is still the only defensible amount"
+            );
+            assert_eq!(
+                unstated.status,
+                CostStatus::Exact,
+                "{model}/{geo:?}: and a request stating no geography is still exact, so the degradation \
+                 above is the stated geography and not the override itself"
+            );
+        }
+    }
+
+    /// No `InferenceGeo` value changes the **cost** of a non-Anthropic entry, and the three that
+    /// ordinary non-Anthropic traffic can carry change nothing at all.
+    ///
+    /// The control entry carries the same rates as the Anthropic one, so a surcharge leaking past
+    /// the provider gate would show as a different total against an identical input.
+    ///
+    /// The status half is deliberately narrower than the cost half. `Unstated` is what every
+    /// non-Anthropic lane projects — it must stay wholly inert, and that is what protects
+    /// unrelated traffic. `Us` and `Other` are written by only one place in the tree, the
+    /// Anthropic usage parser, so an entry seeing either while not labelled `anthropic` is not
+    /// other-provider traffic at all: it is an Anthropic response priced against an entry that
+    /// lost its label, which `pricing.overrides` produces. Billing that at 1.0 is right; calling
+    /// it `Exact` is the defect. See
+    /// [`geo_stated_without_a_rate_degrades_rather_than_billing_short`].
+    #[test]
+    fn geo_never_changes_another_providers_cost() {
+        let calc = geo_fixture_calc();
+        let baseline = calc
+            .calculate(GEO_CONTROL_MODEL, &geo_usage(InferenceGeo::Unstated, false))
+            .expect("prices");
+
+        for geo in [
+            InferenceGeo::Us,
+            InferenceGeo::Global,
+            InferenceGeo::NotAvailable,
+            InferenceGeo::Other,
+        ] {
+            let cost = calc
+                .calculate(GEO_CONTROL_MODEL, &geo_usage(geo, false))
+                .expect("prices");
+            assert_eq!(
+                components(&cost),
+                components(&baseline),
+                "{geo:?} must not change a non-Anthropic entry's cost"
+            );
+        }
+
+        // The values ordinary non-Anthropic traffic can actually carry move nothing, status
+        // included — the guarantee that keeps this axis off unrelated requests.
+        for geo in [
+            InferenceGeo::Unstated,
+            InferenceGeo::Global,
+            InferenceGeo::NotAvailable,
+        ] {
+            let cost = calc
+                .calculate(GEO_CONTROL_MODEL, &geo_usage(geo, false))
+                .expect("prices");
+            assert_eq!(
+                cost.status, baseline.status,
+                "{geo:?} must not change a non-Anthropic entry's status"
+            );
+        }
     }
 
     #[test]

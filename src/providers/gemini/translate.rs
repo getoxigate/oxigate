@@ -719,7 +719,7 @@ pub fn gemini_embedding_to_openai(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::chat::MessageContent;
+    use crate::domain::chat::{InferenceGeo, MessageContent};
     use crate::domain::ports::TokenUsage;
     use crate::providers::gemini::types::Candidate;
     use crate::providers::usage_parity::assert_usage_parity;
@@ -1290,6 +1290,8 @@ mod tests {
             cache_read_input_tokens: Some(100_000),
             prompt_tokens_details: None,
             accounting: GEMINI_ACCOUNTING,
+            // This lane models no geography, so its projection carries the inert default.
+            inference_geo: InferenceGeo::Unstated,
             cache_write: Default::default(),
             image_units: None,
             audio_seconds: None,

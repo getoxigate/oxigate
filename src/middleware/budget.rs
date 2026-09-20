@@ -34,7 +34,7 @@ enum DedupAction {
 
 /// Request-scoped budget check output used by `BudgetResponseLayer` for header injection.
 ///
-/// Shared within the Pro feature set: `HardCapLayer` reads `spend_nano_usd` from this
+/// Shared across budget middleware: `HardCapLayer` reads `spend_nano_usd` from this
 /// struct (set in request extensions by `BudgetLayer`) to avoid a second Redis GET for
 /// the same identity spend key per request. Remains `pub(crate)` — no public API.
 #[derive(Debug, Clone)]
@@ -60,7 +60,7 @@ pub struct BudgetRuntimeConfig {
     pub tz: chrono_tz::Tz,
     /// Next automatic boundary (UTC). May be explicit `budget_reset_at` from config.
     pub next_reset_at: chrono::DateTime<chrono::Utc>,
-    /// Pro scheduler wake interval (seconds).
+    /// Background scheduler wake interval (seconds).
     pub scheduler_interval_secs: u64,
     /// When set, used instead of `Utc::now()` for period keys and lazy reset.
     /// **Never enable `test-hooks` in production** — this field exists only under

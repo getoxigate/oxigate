@@ -101,6 +101,14 @@ const FIVE_M_ONLY_MODEL: &str = "anthropic.accounting-contract-fixture-5m-only";
 /// A model deliberately absent from the synthetic catalogue, for the `cost-unavailable` row.
 const UNCATALOGUED_MODEL: &str = "anthropic.accounting-contract-uncatalogued";
 
+/// The model the inference-geo rows price against.
+///
+/// Its catalogue entry is the only one here declaring `"provider": "anthropic"`, because the
+/// geographic surcharge is gated on the provider that publishes it. Priced against
+/// [`PRIMARY_MODEL`]'s `"synthetic"` entry the surcharge would never apply, and the rows would
+/// pass green while proving nothing.
+const GEO_MODEL: &str = "anthropic.accounting-contract-fixture-geo";
+
 /// Where [`PRIMARY_MODEL`]'s upper tier starts.
 ///
 /// Every primary fixture keeps its plain input below this and reaches it only through its cache
@@ -135,6 +143,16 @@ const UPPER_TIER_THRESHOLD: u64 = 30_000;
 /// | cache read | × 0.2 | 820 |
 /// | cache write `5m`, and the fallback | × 1.3 | 5,330 |
 ///
+/// [`GEO_MODEL`] — one tier, from 0, and the only entry declaring `"provider": "anthropic"`. No
+/// cache or thinking rates: the inference-geo rows are about a surcharge reaching the spend row
+/// and the budget counter, and a plain input/output oracle makes the 1.1x unmistakable rather
+/// than something to be picked out of a stack of multipliers.
+///
+/// | Rate | Tier 0 (from 0) | nano-USD per token |
+/// |---|---|---|
+/// | input | 6.0e-06 | 6,000 |
+/// | output | 3.0e-05 | 30,000 |
+///
 /// [`UNCATALOGUED_MODEL`] is absent on purpose.
 fn synthetic_catalogue() -> String {
     let cache_writes = serde_json::json!({"5m": 1.35, "1h": 2.2, "30m": 1.45});
@@ -151,6 +169,17 @@ fn synthetic_catalogue() -> String {
                         "output_per_token": 1.7e-05,
                         "cache_read_multiplier": 0.2,
                         "cache_write_multipliers": {"5m": 1.3}
+                    }
+                ]
+            },
+            GEO_MODEL: {
+                "provider": "anthropic",
+                "context_window": 1_000_000,
+                "tiers": [
+                    {
+                        "threshold": 0,
+                        "input_per_token": 6.0e-06,
+                        "output_per_token": 3.0e-05
                     }
                 ]
             },
@@ -782,9 +811,9 @@ const ANTHROPIC_USAGE: &str = r#"{"input_tokens":20000,"cache_creation_input_tok
 
 /// A Messages response carrying `usage`, with the thinking block extended thinking returns
 /// ahead of the text.
-fn anthropic_buffered_body(usage: &str) -> Vec<u8> {
+fn anthropic_buffered_body(model: &str, usage: &str) -> Vec<u8> {
     format!(
-        r#"{{"id":"msg_accounting_contract","type":"message","role":"assistant","model":"{PRIMARY_MODEL}","content":[{{"type":"thinking","thinking":"Reviewing the cached document.","signature":"accounting-contract-signature"}},{{"type":"text","text":"Summary."}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{usage}}}"#
+        r#"{{"id":"msg_accounting_contract","type":"message","role":"assistant","model":"{model}","content":[{{"type":"thinking","thinking":"Reviewing the cached document.","signature":"accounting-contract-signature"}},{{"type":"text","text":"Summary."}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{usage}}}"#
     )
     .into_bytes()
 }
@@ -892,7 +921,7 @@ fn anthropic_rows() -> [Row; 2] {
             lane: Lane::Anthropic,
             delivery: Delivery::Buffered,
             model: PRIMARY_MODEL,
-            upstream: anthropic_buffered_body(ANTHROPIC_USAGE),
+            upstream: anthropic_buffered_body(PRIMARY_MODEL, ANTHROPIC_USAGE),
             accounting: ANTHROPIC_CONTRACT_ACCOUNTING,
             raw_cache_write_tokens: None,
         },
@@ -906,6 +935,125 @@ fn anthropic_rows() -> [Row; 2] {
             raw_cache_write_tokens: None,
         },
     ]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Anthropic inference geo
+// ---------------------------------------------------------------------------------------------
+
+/// The usage object both inference-geo rows receive, differing only in the geography stated.
+///
+/// 10,000 input and 2,000 output tokens, and nothing else — the surcharge is the subject, so
+/// every other dimension is left at zero rather than added to the pile the oracle has to unwind.
+fn anthropic_geo_usage(inference_geo: &str) -> String {
+    format!(r#"{{"input_tokens":10000,"output_tokens":2000,"inference_geo":"{inference_geo}"}}"#)
+}
+
+/// A streamed Messages response stating a geography on `message_start` and nothing on
+/// `message_delta`, which is where the provider states it.
+///
+/// That asymmetry is the point on this path: the terminal event carries the final counts but no
+/// geography, so a streamed projection that read geo from the terminal event would silently drop
+/// the surcharge — and the buffered row beside this one would still pass.
+fn anthropic_geo_streamed_body(inference_geo: &str) -> Vec<u8> {
+    let message_start = format!(
+        r#"{{"type":"message_start","message":{{"id":"msg_accounting_contract","type":"message","role":"assistant","content":[],"model":"{GEO_MODEL}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":10000,"output_tokens":1,"inference_geo":"{inference_geo}"}}}}}}"#
+    );
+    let events: [(&str, &str); 5] = [
+        ("message_start", &message_start),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Summary."}}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":10000,"output_tokens":2000}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ];
+    events
+        .iter()
+        .map(|(kind, data)| format!("event: {kind}\ndata: {data}\n\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// The oracle for a `us` request against [`GEO_MODEL`].
+///
+/// | Component | Quantity × rate | Standard | × 1.1 |
+/// |---|---|---|---|
+/// | input | 10,000 × 6,000 | 60,000,000 | 66,000,000 |
+/// | output | 2,000 × 30,000 | 60,000,000 | 66,000,000 |
+/// | **total** | | **120,000,000** | **132,000,000** |
+///
+/// The defect this row exists for is that the persisted and budgeted figures are short, not that
+/// a header is: 120,000,000 is what both surfaces carried before the fix, and it is what they
+/// would carry again if the surcharge reached only the response headers.
+const ANTHROPIC_GEO_US_ACCOUNTING: Accounting = Accounting {
+    cost_nano_usd: 132_000_000,
+    status: CostStatus::Exact,
+    prompt_tokens: 10_000,
+    completion_tokens: 2_000,
+    cache_read_tokens: 0,
+    thinking_tokens: 0,
+    cache_write: None,
+};
+
+/// Anthropic US-only inference, buffered and streamed. **Contract fixture.**
+///
+/// Usage members and their relationships, per Anthropic: the response `usage` object carries an
+/// `inference_geo` member stating where inference ran, whose documented values are `us`,
+/// `global` and `not_available`; US-only inference on Claude 4.6 and later is priced at 1.1x
+/// across all token pricing categories
+/// (`platform.claude.com/docs/en/manage-claude/data-residency`,
+/// `platform.claude.com/docs/en/manage-claude/usage-cost-api`, accessed 2026-09-17). The member
+/// is stated on the buffered `usage` object and on `message_start`, and is not restated on
+/// `message_delta`. Oracle: [`ANTHROPIC_GEO_US_ACCOUNTING`].
+fn anthropic_geo_rows() -> [Row; 2] {
+    [
+        Row {
+            name: "anthropic inference geo us buffered",
+            lane: Lane::Anthropic,
+            delivery: Delivery::Buffered,
+            model: GEO_MODEL,
+            upstream: anthropic_buffered_body(GEO_MODEL, &anthropic_geo_usage("us")),
+            accounting: ANTHROPIC_GEO_US_ACCOUNTING,
+            raw_cache_write_tokens: None,
+        },
+        Row {
+            name: "anthropic inference geo us streamed",
+            lane: Lane::Anthropic,
+            delivery: Delivery::Streamed,
+            model: GEO_MODEL,
+            upstream: anthropic_geo_streamed_body("us"),
+            accounting: ANTHROPIC_GEO_US_ACCOUNTING,
+            raw_cache_write_tokens: None,
+        },
+    ]
+}
+
+/// The same request reporting `global` bills the standard rate, on the same two surfaces.
+///
+/// Its oracle is [`ANTHROPIC_GEO_US_ACCOUNTING`]'s standard column. Without it the `us` rows
+/// would prove that 132,000,000 is persisted, but not that the 12,000,000 difference is the
+/// geography rather than the fixture's rates.
+fn anthropic_geo_control_row() -> Row {
+    Row {
+        name: "anthropic inference geo global buffered",
+        lane: Lane::Anthropic,
+        delivery: Delivery::Buffered,
+        model: GEO_MODEL,
+        upstream: anthropic_buffered_body(GEO_MODEL, &anthropic_geo_usage("global")),
+        accounting: Accounting {
+            cost_nano_usd: 120_000_000,
+            ..ANTHROPIC_GEO_US_ACCOUNTING
+        },
+        raw_cache_write_tokens: None,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1336,7 +1484,7 @@ fn reconciled_row() -> Row {
         lane: Lane::Anthropic,
         delivery: Delivery::Buffered,
         model: PRIMARY_MODEL,
-        upstream: anthropic_buffered_body(ANTHROPIC_CONTRADICTORY_USAGE),
+        upstream: anthropic_buffered_body(PRIMARY_MODEL, ANTHROPIC_CONTRADICTORY_USAGE),
         accounting: RECONCILED_ACCOUNTING,
         raw_cache_write_tokens: None,
     }
@@ -1738,9 +1886,11 @@ async fn accounting_contract_matrix() {
         .chain(azure_rows())
         .chain(compat_rows())
         .chain(anthropic_rows())
+        .chain(anthropic_geo_rows())
         .chain(gemini_rows())
         .chain(bedrock_rows())
         .chain([
+            anthropic_geo_control_row(),
             rate_fallback_row(),
             incomplete_evidence_row(),
             cost_unavailable_row(),

@@ -62,6 +62,7 @@ pub(super) fn assert_usage_parity(buffered: &Usage, streamed: &Usage, case: &str
         cache_read_input_tokens,
         prompt_tokens_details,
         accounting,
+        inference_geo,
         cache_write,
         image_units,
         audio_seconds,
@@ -108,6 +109,10 @@ pub(super) fn assert_usage_parity(buffered: &Usage, streamed: &Usage, case: &str
         "{case}: prompt_tokens_details"
     );
     assert_eq!(*accounting, streamed.accounting, "{case}: accounting");
+    assert_eq!(
+        *inference_geo, streamed.inference_geo,
+        "{case}: inference_geo"
+    );
     assert_eq!(*image_units, streamed.image_units, "{case}: image_units");
     assert_eq!(
         *audio_seconds, streamed.audio_seconds,

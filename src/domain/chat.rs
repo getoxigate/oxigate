@@ -228,6 +228,39 @@ pub enum ReasoningAccounting {
     IncludedInOutput,
 }
 
+/// Where the provider stated that inference ran for one request.
+///
+/// A per-response observation, not a contract declaration: the same model on the same key can
+/// report a different value on the next request, so this is deliberately not part of
+/// [`UsageAccounting`].
+///
+/// Only a provider lane that actually reads a geo member ever writes anything but
+/// [`Unstated`](Self::Unstated). Every other lane inherits the default, which is inert — no
+/// multiplier, no status change, no warning — so a lane that knows nothing about inference
+/// geography bills exactly as it did before this axis existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InferenceGeo {
+    /// The response stated no geography — the member was absent or `null`, or the lane does not
+    /// model one at all.
+    #[default]
+    Unstated,
+    /// Inference ran on US-only infrastructure, which carries a surcharge on providers that
+    /// price it separately.
+    Us,
+    /// Inference was free to run in any geography, which is the unsurcharged default everywhere.
+    Global,
+    /// The model does not support geographic pinning, so the provider has no geography to
+    /// report. Priced at the standard rate, which is what such a model is billed at.
+    NotAvailable,
+    /// The provider stated a geography this gateway does not recognise.
+    ///
+    /// Carries no payload deliberately. Keeping the raw string would make this type non-`Copy`
+    /// and would put provider-supplied text on a path toward `WarningFacts`, which holds only
+    /// bounded gateway-authored content. The value is therefore discarded; what survives is the
+    /// fact that one arrived, which is what degrades the request's cost confidence.
+    Other,
+}
+
 /// The token accounting semantics of the provider contract that produced a `Usage`.
 ///
 /// One value carries both axes so a provider contract has a single place to declare them, and so
@@ -286,6 +319,13 @@ pub struct Usage {
     /// Token accounting semantics declared by the provider contract that produced this usage.
     #[serde(skip, default)]
     pub accounting: UsageAccounting,
+    /// Where the provider stated inference ran for this request.
+    ///
+    /// `skip` keeps it off the wire in both directions: it is gateway-internal pricing input,
+    /// not part of the OpenAI-compatible usage schema, and republishing a provider's own geo
+    /// string would be a new response field this gateway does not owe anyone.
+    #[serde(skip, default)]
+    pub inference_geo: InferenceGeo,
     /// Generalized cache-write accounting for this response, and the pricing generation the
     /// request was dispatched under.
     ///

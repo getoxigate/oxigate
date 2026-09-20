@@ -15,7 +15,7 @@ use axum::http::header::{HeaderMap, HeaderValue};
 use axum::response::Response;
 use tracing::warn;
 
-use crate::domain::chat::{CacheAccounting, ReasoningAccounting, Usage};
+use crate::domain::chat::{CacheAccounting, InferenceGeo, ReasoningAccounting, Usage};
 use crate::domain::ports::{CostCalculator, TokenUsage};
 use crate::domain::pricing::BundledCostCalculator;
 use crate::domain::usage_accounting::{
@@ -122,6 +122,7 @@ pub fn build_cost_headers(
         image_count: usage.image_units.unwrap_or(0),
         audio_seconds: usage.audio_seconds.unwrap_or(0.0),
         reasoning_accounting: usage.accounting.reasoning,
+        inference_geo: usage.inference_geo,
     };
     let invariants =
         detect_usage_invariants(usage, cache_read, accounted_cache_write, thinking_tokens);
@@ -336,6 +337,13 @@ fn assemble_cost_headers(
     }
     if reconciliation.reasoning_exceeds_completion {
         warning.add(WarningReason::ReasoningExceedsCompletion);
+    }
+    // Named beside the generic `RateFallback` the status itself produces, because "a rate fell
+    // back" does not say which one, and an unrecognised geography is the one an operator can
+    // actually act on — it means the provider is reporting a geography this build has no rate
+    // for. `WarningFacts::add` de-duplicates, so the pair stays one warning.
+    if token_usage.inference_geo == InferenceGeo::Other {
+        warning.add(WarningReason::InferenceGeoUnrecognized);
     }
     match status {
         CostStatus::RateFallback => warning.add(WarningReason::RateFallback),
@@ -1052,6 +1060,62 @@ mod tests {
                 .warning
                 .reasons()
                 .contains(&WarningReason::RateFallback)
+        );
+    }
+
+    /// An unrecognised inference geography names itself in the warning, beside the generic
+    /// fallback reason, once each.
+    ///
+    /// `RateFallback` alone says a rate fell back without saying which one; an operator seeing
+    /// it on an Anthropic request would look at the cache multipliers first. The geo reason is
+    /// what points at the actual cause — the provider is reporting a geography this build has no
+    /// rate for — so the two travel together in the one warning `WarningFacts` is allowed to
+    /// carry. The raw value is deliberately not among them: nothing provider-supplied reaches
+    /// this type.
+    #[test]
+    fn test_unrecognized_inference_geo_names_itself_beside_the_fallback_reason() {
+        let priced = |inference_geo| {
+            let token_usage = TokenUsage {
+                input_tokens: 1_000,
+                output_tokens: 500,
+                inference_geo,
+                ..Default::default()
+            };
+            assemble_cost_headers(
+                "claude-sonnet-4-6",
+                &token_usage,
+                1_000,
+                500,
+                holder(),
+                ReconciliationFacts::default(),
+            )
+            .1
+        };
+
+        let baseline = priced(InferenceGeo::Unstated);
+        assert_eq!(baseline.cost.status, CostStatus::Exact);
+        assert!(
+            baseline.warning.reasons().is_empty(),
+            "an unstated geography is inert and must raise nothing"
+        );
+
+        let other = priced(InferenceGeo::Other);
+        assert_eq!(
+            other.cost.total_cost, baseline.cost.total_cost,
+            "no known surcharge can be applied, so the amount billed does not move"
+        );
+        assert_eq!(
+            other.cost.status,
+            CostStatus::RateFallback,
+            "but the confidence in that amount does"
+        );
+        assert_eq!(
+            other.warning.reasons(),
+            &[
+                WarningReason::InferenceGeoUnrecognized,
+                WarningReason::RateFallback
+            ],
+            "both reasons, each exactly once, in one warning"
         );
     }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 OxiGate contributors
-//! Shared CLI utilities used by both the community and Pro binaries.
+//! Shared CLI utilities used by the gateway binaries.
 
 use std::path::PathBuf;
 

@@ -216,8 +216,10 @@ does with it.
 - **Semantics:** `https://platform.claude.com/docs/en/api/messages` and
   `https://platform.claude.com/docs/en/build-with-claude/streaming`; the pricing statements below
   from `https://platform.claude.com/docs/en/about-claude/pricing` and
-  `https://platform.claude.com/docs/en/manage-claude/data-residency`.
-- Accessed 2026-09-11.
+  `https://platform.claude.com/docs/en/manage-claude/data-residency`; the documented
+  `inference_geo` value set from
+  `https://platform.claude.com/docs/en/manage-claude/usage-cost-api` (§Data residency).
+- Accessed 2026-09-11; the data-residency, pricing and usage-and-cost pages re-read 2026-09-17.
 
 **Not read** means the member plays no part in cost, cost status, the spend row or the budget
 counter.
@@ -234,11 +236,72 @@ counter.
 | `server_tool_use.web_search_requests` | ✓ | ✓ | Not read. Web search is charged per search, beside tokens. Not reachable today: the request translation forwards function tools only, so no server tool can be declared through the gateway |
 | `server_tool_use.web_fetch_requests` | ✓ | ✓ | Not read. Web fetch carries no charge beyond the tokens it adds, which are already in `input_tokens`. Not reachable, for the same reason |
 | `service_tier` | ✓ | — | Not read. A `priority` request draws down a Priority Tier capacity commitment instead of being billed at the standard per-token rate the gateway applies to every request. Anthropic no longer sells new commitments |
-| `inference_geo` | ✓ | — | Not read — **a known gap that moves the bill.** US-only inference on Claude 4.6 and later is priced at 1.1× in every token category. The gateway sends no `inference_geo`, so the workspace's `default_inference_geo` decides; where that is `us` — including every workspace migrated from the former US-only opt-out — the gateway's cost and budget figures are 1/1.1 of the bill |
+| `inference_geo` | ✓ | — | The geographic pricing multiplier. `us` scales input, output, cache-read, cache-write and thinking cost by 1.1×; `global` and `not_available` price at the standard rate; an absent or `null` member does the same. Any other string prices at the standard rate and reports `rate-fallback` — see [Inference geography](#inference-geography) |
 
 A `cache_creation` member Anthropic adds later in the `ephemeral_<duration>_input_tokens` form is
 accounted as its own class without a code change, as described under
 [Prompt Caching](#prompt-caching).
+
+---
+
+## Inference geography
+
+Anthropic prices US-only inference above global routing on its newer models, and reports where
+inference actually ran on the response's `usage.inference_geo`. The gateway reads that member and
+prices the request accordingly.
+
+**Sources.** `https://platform.claude.com/docs/en/manage-claude/data-residency` (§Pricing) and
+`https://platform.claude.com/docs/en/about-claude/pricing` (§Data residency pricing): "For Claude
+4.6 and later models, specifying US-only inference through the `inference_geo` parameter incurs a
+1.1x multiplier on all token pricing categories, including input tokens, output tokens, cache
+writes, and cache reads", global routing uses standard pricing, and earlier models do not support
+the parameter and always use standard pricing.
+`https://platform.claude.com/docs/en/manage-claude/usage-cost-api` (§Data residency) gives the
+value set — "Valid values are `global`, `us`, and `not_available`" — and states that models
+without `inference_geo` support report `not_available`. All three accessed 2026-09-17.
+
+| Reported value | Multiplier | Cost status | Structured-warning reason |
+|---|---|---|---|
+| `us` | 1.1× | unchanged | none |
+| `global` | 1.0× | unchanged | none |
+| `not_available` | 1.0× | unchanged | none |
+| absent, or `null` | 1.0× | unchanged | none |
+| any other string, including `""` | 1.0× | `rate-fallback` | `inference-geo-unrecognized` |
+| `us`, on a model with no applicable rate | 1.0× | `rate-fallback` | none |
+
+The multiplier reaches the five **token-category** components — input, standard output, cache
+reads, cache writes and thinking. Image units and audio seconds are not token categories and are
+not scaled.
+
+It applies last, after the cache and batch multipliers, so it scales their results rather than the
+underlying rates — which is what Anthropic means by the data-residency multiplier stacking with
+prompt caching and the Batch API. Each multiplier pass truncates toward zero in nano-USD
+independently, so a request carrying both a batch discount and the geographic surcharge is billed
+the twice-truncated integer, not an exact 1.1 ratio of its unbatched cost.
+
+**An unrecognised value is not treated as global.** A geography this build has no rate for is
+priced at the standard rate, because there is no other defensible figure — but the request's cost
+status drops to `rate-fallback` and the warning names the reason. Billing an unknown geography
+silently at the standard rate is how a surcharge stays invisible until it shows up on an invoice.
+The unrecognised value itself is logged once at DEBUG, length-capped, so an operator can see which
+geography arrived; it is not carried on the response or persisted.
+
+**The same rule covers a model priced by a `pricing.overrides` entry.** An override for a model
+the bundled catalogue does not contain — a Claude release newer than the last asset refresh, say —
+produces an entry the gateway cannot attribute to a provider, and so cannot apply a published
+surcharge to. Such a request reporting `us` is priced at the standard rate and reported
+`rate-fallback`, never `exact`. If you override a model that Anthropic prices US-only inference
+for, set the override to the rate you actually expect to be billed.
+
+**The gateway never sends `inference_geo`.** The parameter controls where customer data is
+processed, which is the operator's decision to make in their Anthropic workspace
+(`default_inference_geo` and `allowed_inference_geos`), not the gateway's to make on their behalf.
+Sending it would also fail closed on every model that predates the parameter, which rejects it
+with a 400. The response member is read, never the request parameter written.
+
+**Only the first-party Claude API reports this member.** On Bedrock and Vertex the inference
+region is selected by the endpoint or inference profile and carries its own regional pricing,
+which no usage member reports; those lanes report no geography and price at the standard rate.
 
 ---
 
