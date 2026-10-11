@@ -569,7 +569,7 @@ impl Drop for InFlightGuard {
         // and both subtract, wrapping to usize::MAX.
         let _ = self
             .counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             });
     }
