@@ -39,8 +39,8 @@ const GEMINI_DEFAULT_TASK_TYPE: &str = "RETRIEVAL_DOCUMENT";
 const GEMINI_BATCH_EMBED_MAX_ITEMS: usize = 100;
 /// Conservative Vertex AI predict limit (items per call; varies by model, 250 is the lowest GA floor).
 const VERTEX_EMBED_MAX_ITEMS: usize = 250;
-/// Maximum input tokens for a single Gemini embedding input (text-embedding-004 / multilingual-002).
-const GEMINI_EMBED_MAX_INPUT_TOKENS: u32 = 2048;
+/// Maximum input tokens for a single Gemini embedding input (gemini-embedding-2).
+const GEMINI_EMBED_MAX_INPUT_TOKENS: u32 = 8192;
 /// Supported output dimension presets for Gemini embedding models (768 native; 3072 max upscaled).
 const GEMINI_EMBED_DIMENSIONS: &[u32] = &[768, 3072];
 
@@ -53,8 +53,6 @@ bitflags! {
         const THINKING_BUDGET = 1 << 0;
         /// Gemini 3.x: supports thinkingLevel (enum). Thinking tokens billed at output rate.
         const THINKING_LEVEL = 1 << 1;
-        /// Model is deprecated; warn at startup if used as default_model.
-        const DEPRECATED = 1 << 2;
         /// Model is in Preview; not GA.
         const PREVIEW = 1 << 3;
     }
@@ -63,7 +61,6 @@ bitflags! {
 // Mirror ModelFlags bits as raw u8 for const array init — bitflags! | is not const-compatible.
 const F_THINKING_BUDGET: u8 = 1 << 0;
 const F_THINKING_LEVEL: u8 = 1 << 1;
-const F_DEPRECATED: u8 = 1 << 2;
 const F_PREVIEW: u8 = 1 << 3;
 
 /// Known Gemini model IDs. Operators may extend via providers.gemini.supported_models in YAML.
@@ -73,20 +70,32 @@ pub(crate) const KNOWN_GEMINI_MODELS: &[(&str, u8)] = &[
     ("gemini-2.5-pro", F_THINKING_BUDGET),
     ("gemini-2.5-flash", F_THINKING_BUDGET),
     ("gemini-2.5-flash-lite", 0),
-    ("gemini-2.0-flash", F_DEPRECATED),
-    ("gemini-2.0-flash-lite", F_DEPRECATED),
-    ("gemini-1.5-pro", F_DEPRECATED),
-    ("gemini-1.5-flash", F_DEPRECATED),
+    ("gemini-3.8-flash", F_THINKING_LEVEL),
+    ("gemini-3.5-flash-lite", F_THINKING_LEVEL),
+    ("gemini-3.1-flash-lite", F_THINKING_LEVEL),
     ("gemini-3.1-pro-preview", F_THINKING_LEVEL | F_PREVIEW),
-    (
-        "gemini-3.1-flash-lite-preview",
-        F_THINKING_LEVEL | F_PREVIEW,
-    ),
     ("gemini-3-flash-preview", F_THINKING_LEVEL | F_PREVIEW),
-    ("text-embedding-004", 0),
-    ("text-multilingual-embedding-002", 0),
-    // Experimental embedding model; pricing matches text-embedding-004 ($0.0000001/token).
-    ("gemini-embedding-exp-03-07", 0),
+    // `gemini-embedding-2` is priced but deliberately not listed: the embeddings path still sends
+    // a task type the model rejects and reads usage from a field its response does not carry, so
+    // a listed model would either fail or be recorded at zero cost.
+];
+
+/// Models kept in [`KNOWN_GEMINI_MODELS`] for their capability flags but left out of the default
+/// model list: exactly the bundled Gemini entries that carry a `deprecation_notice`.
+///
+/// Other lanes list a model until its shutdown, and the refresh that removes the priced entry
+/// takes it off the list. That does not work here: this lane serves Vertex and the Gemini API from
+/// one list, and Vertex retires models while the Gemini API still serves them, so the entry stays
+/// priced and nothing would ever delist it. The lane therefore drops a model at its first announced
+/// shutdown. Vertex AI retires these on 2026-10-20
+/// (docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions).
+///
+/// `supported_models` replaces the default list rather than extending it, so an operator on the
+/// Gemini API who keeps one of these must also name every default model they still want.
+pub(crate) const NOT_DEFAULT: &[&str] = &[
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
 ];
 
 pub(crate) fn model_flags(model: &str) -> ModelFlags {
@@ -174,24 +183,10 @@ impl GeminiAdapter {
         } else {
             KNOWN_GEMINI_MODELS
                 .iter()
-                .filter(|(_, bits)| (*bits & F_DEPRECATED) == 0)
+                .filter(|(id, _)| !NOT_DEFAULT.contains(id))
                 .map(|(id, _)| (*id).to_string())
                 .collect()
         };
-
-        const DEPRECATION_RETIREMENT_DATE: &str = "2026-06-01"; // update if Google extends deadline
-        if let Some(ref default_model) = config.default_model
-            && let Some((_, bits)) = KNOWN_GEMINI_MODELS
-                .iter()
-                .find(|(id, _)| *id == default_model.as_str())
-            && (*bits & F_DEPRECATED) != 0
-        {
-            warn!(
-                model = %default_model,
-                "Gemini default model is deprecated and will be retired on {}",
-                DEPRECATION_RETIREMENT_DATE
-            );
-        }
 
         let metadata = ProviderMetadata {
             name: "google".to_string(),
@@ -222,7 +217,7 @@ impl GeminiAdapter {
             self.config
                 .default_model
                 .clone()
-                .unwrap_or_else(|| "gemini-2.0-flash".into())
+                .unwrap_or_else(|| "gemini-3.8-flash".into())
         } else {
             req_model.to_string()
         }
@@ -346,7 +341,7 @@ impl GeminiAdapter {
 impl ProviderAdapter for GeminiAdapter {
     async fn chat_completion(&self, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         let model = self.model(&req.model);
-        let request_id = req.request_id.as_deref().unwrap_or("unknown");
+        let request_id = &req.request_id_or_mint(&self.metadata().name);
 
         let gemini_req = translate::openai_to_gemini(req, self.config.resolved_thinking_budget())?;
 
@@ -392,7 +387,7 @@ impl ProviderAdapter for GeminiAdapter {
         req: &ChatRequest,
     ) -> Result<ChatCompletionStream, ProviderError> {
         let model = self.model(&req.model);
-        let request_id = req.request_id.as_deref().unwrap_or("unknown");
+        let request_id = &req.request_id_or_mint(&self.metadata().name);
 
         let gemini_req = translate::openai_to_gemini(req, self.config.resolved_thinking_budget())?;
 
@@ -753,7 +748,8 @@ impl ProviderAdapter for GeminiAdapter {
     }
 
     async fn health_check(&self) -> HealthStatus {
-        let model = self.model("gemini-2.0-flash");
+        // An empty name resolves to the configured `default_model`.
+        let model = self.model("");
         let url = match &self.auth {
             GeminiAuth::ApiKey(_) => {
                 let base = gemini_base_url(&self.config);
@@ -796,7 +792,6 @@ impl ProviderAdapterExt for GeminiAdapter {}
 mod tests {
     use super::*;
     use crate::config::{GeminiConfig, GeminiMode, SecretString};
-    use tracing_test::traced_test;
 
     fn gemini_config_api(mock_base: &str) -> GeminiConfig {
         GeminiConfig {
@@ -805,7 +800,7 @@ mod tests {
             vertex_project: None,
             vertex_location: None,
             vertex_service_account_json: None,
-            default_model: Some("gemini-2.0-flash".into()),
+            default_model: Some("gemini-3.8-flash".into()),
             timeout_secs: Some(10),
             api_base_url: Some(mock_base.to_string()),
             vertex_base_url_override: None,
@@ -815,19 +810,47 @@ mod tests {
         }
     }
 
-    #[traced_test]
     #[tokio::test]
-    async fn test_deprecated_model_triggers_startup_warn() {
-        let mock = wiremock::MockServer::start().await;
-        let mut config = gemini_config_api(mock.uri().trim_end_matches('/'));
-        config.default_model = Some("gemini-2.0-flash".into());
-        let _adapter = GeminiAdapter::new(config)
+    async fn health_check_probes_the_configured_default_model() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut config = gemini_config_api(&server.uri());
+        config.default_model = Some("gemini-3.1-flash-lite".into());
+        let adapter = GeminiAdapter::new(config)
             .await
             .expect("adapter must build");
-        assert!(
-            logs_contain("deprecated"),
-            "must warn when default_model is deprecated"
-        );
+
+        assert_eq!(adapter.health_check().await, HealthStatus::Healthy);
+    }
+
+    /// Vertex AI retires the Gemini 2.5 models on 2026-10-20. The lane serves Vertex and the
+    /// Gemini API alike, so they leave the default list but keep their thinking flags for
+    /// operators who still name them.
+    #[tokio::test]
+    async fn test_default_list_omits_models_retired_on_vertex() {
+        let adapter = GeminiAdapter::new(gemini_config_api("http://localhost:9"))
+            .await
+            .expect("adapter must build");
+        let listed = &adapter.metadata().supported_models;
+        for retired in [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ] {
+            assert!(
+                !listed.iter().any(|m| m == retired),
+                "`{retired}` is retired on Vertex but still in the default list"
+            );
+        }
+        assert!(model_flags("gemini-2.5-pro").contains(ModelFlags::THINKING_BUDGET));
+        assert!(model_flags("gemini-2.5-flash-lite").is_empty());
     }
 
     #[tokio::test]
@@ -846,27 +869,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_supported_models_default_excludes_deprecated() {
-        let mock = wiremock::MockServer::start().await;
-        let config = gemini_config_api(mock.uri().trim_end_matches('/'));
-        let adapter = GeminiAdapter::new(config)
-            .await
-            .expect("adapter must build");
-        let meta = adapter.metadata();
-        assert!(
-            !meta
-                .supported_models
-                .contains(&"gemini-2.0-flash".to_string()),
-            "deprecated models must be excluded from default list"
-        );
-        assert!(
-            meta.supported_models
-                .contains(&"gemini-2.5-pro".to_string()),
-            "non-deprecated thinking models must be included"
-        );
-    }
-
     #[test]
     fn test_supports_thinking_flag_set_for_thinking_models() {
         let flags_25_pro = model_flags("gemini-2.5-pro");
@@ -881,14 +883,7 @@ mod tests {
             "gemini-3.1-pro-preview must have THINKING_LEVEL"
         );
 
-        let flags_20 = model_flags("gemini-2.0-flash");
-        assert!(
-            !flags_20.contains(ModelFlags::THINKING_BUDGET)
-                && !flags_20.contains(ModelFlags::THINKING_LEVEL),
-            "gemini-2.0-flash must not have thinking flags"
-        );
-
-        let flags_embed = model_flags("text-embedding-004");
+        let flags_embed = model_flags("gemini-embedding-2");
         assert!(
             !flags_embed.contains(ModelFlags::THINKING_BUDGET)
                 && !flags_embed.contains(ModelFlags::THINKING_LEVEL),
@@ -903,11 +898,11 @@ mod tests {
         let config = gemini_config_api(mock.uri().trim_end_matches('/'));
         let adapter = GeminiAdapter::new(config).await.expect("adapter created");
         let url = adapter
-            .build_embed_url("text-embedding-004", "embedContent")
+            .build_embed_url("gemini-embedding-2", "embedContent")
             .expect("url built");
         let url_str = url.to_string();
         assert!(
-            url_str.contains("/v1/models/text-embedding-004:embedContent"),
+            url_str.contains("/v1/models/gemini-embedding-2:embedContent"),
             "default embed URL must use /v1/models: {url_str}"
         );
     }
@@ -920,11 +915,11 @@ mod tests {
         config.embed_api_version = Some("v1beta".to_string());
         let adapter = GeminiAdapter::new(config).await.expect("adapter created");
         let url = adapter
-            .build_embed_url("text-embedding-004", "embedContent")
+            .build_embed_url("gemini-embedding-2", "embedContent")
             .expect("url built");
         let url_str = url.to_string();
         assert!(
-            url_str.contains("/v1beta/models/text-embedding-004:embedContent"),
+            url_str.contains("/v1beta/models/gemini-embedding-2:embedContent"),
             "custom embed_api_version must be used: {url_str}"
         );
     }
@@ -936,7 +931,7 @@ mod tests {
         let config = gemini_config_api(mock.uri().trim_end_matches('/'));
         let adapter = GeminiAdapter::new(config).await.expect("adapter created");
         let url = adapter
-            .build_embed_url("text-embedding-004", "batchEmbedContents")
+            .build_embed_url("gemini-embedding-2", "batchEmbedContents")
             .expect("url built");
         assert!(
             url.to_string().contains(":batchEmbedContents"),
@@ -952,7 +947,7 @@ mod tests {
 
     fn embedding_req(inputs: Vec<&str>) -> EmbeddingRequest {
         EmbeddingRequest {
-            model: "text-embedding-004".into(),
+            model: "gemini-embedding-2".into(),
             input: if inputs.len() == 1 {
                 crate::domain::embedding::EmbeddingInput::Single(inputs[0].to_string())
             } else {
@@ -973,7 +968,7 @@ mod tests {
             .await
             .expect("adapter must build");
         let req = EmbeddingRequest {
-            model: "text-embedding-004".into(),
+            model: "gemini-embedding-2".into(),
             input: crate::domain::embedding::EmbeddingInput::Batch(vec![]),
             dimensions: None,
             encoding_format: None,

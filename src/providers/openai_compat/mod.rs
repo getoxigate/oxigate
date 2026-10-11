@@ -472,8 +472,16 @@ mod tests {
             label: None,
             tags: std::collections::HashMap::new(),
         };
-        let row =
-            |accounting| SpendRecord::build(&identity, "gpt-5.6-terra", "compat", accounting, 1);
+        let row = |accounting| {
+            SpendRecord::build(
+                crate::domain::request_id::RequestId::mint(),
+                &identity,
+                "gpt-5.6-terra",
+                "compat",
+                accounting,
+                1,
+            )
+        };
         let (row_a, row_b) = (row(&a), row(&b));
         assert_eq!(row_a.prompt_tokens, row_b.prompt_tokens);
         assert_eq!(row_a.completion_tokens, row_b.completion_tokens);

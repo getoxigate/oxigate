@@ -164,6 +164,7 @@ HTTP 400. Use non-streaming when tools are required with Bedrock.
 
 | Date | Change |
 |------|--------|
+| 2026-10-10 | Every active Claude model ID on Bedrock except `anthropic.claude-mythos-5` is now priced, including the Messages-API endpoint IDs (`anthropic.claude-opus-5-5` and siblings), which the adapter forwards through its `anthropic.*` wildcard. `anthropic.claude-mythos-5` is not in the pricing source yet: the wildcard still forwards it, and its requests are recorded at zero cost. The advertised default list names the base IDs Anthropic documents for the Converse integration; the retired Claude 3.x IDs are gone from it |
 | 2026-09-03 | Cache read, cache write and the `cacheDetails` breakdown are parsed and billed on both Converse paths. Cached spend that was previously invisible now costs money and counts against budgets |
 | 2026-08-23 | Cache accounting declared additive, matching the Converse contract. No billed amount moves — cache tokens are not parsed yet |
 | 2026-05-05 | Non-streaming tool use translation; streaming guard |

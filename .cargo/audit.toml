@@ -1,0 +1,18 @@
+# `cargo audit` policy for this workspace.
+#
+# An advisory is ignored only when no fixed version exists and the crate is
+# absent from the release binary (`cargo tree -e normal -i <crate>` prints
+# nothing). An ignore also silences future updates to that advisory, so each
+# entry states what would let it be removed.
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — rsa: Marvin timing side channel; no fixed release.
+    # Not linked into the gateway binary. Two lockfile paths reach it:
+    #   - dev-dependency: generates throwaway service-account keys for the
+    #     Gemini auth tests;
+    #   - sqlx-mysql: an optional sqlx / sqlx-macros-core dependency that is
+    #     never compiled (sqlx features select postgres only).
+    # Removable once rsa ships a fix, or once both paths are gone from the
+    # lockfile — replacing the test keys alone leaves the sqlx-mysql path.
+    "RUSTSEC-2023-0071",
+]

@@ -8,6 +8,7 @@
 
 use crate::domain::auth::RequestIdentity;
 use crate::domain::ports::NanoUsd;
+use crate::domain::request_id::RequestId;
 use crate::domain::usage_accounting::{CostStatus, FinalizedAccounting, UsageEvidence};
 
 /// One row to persist in `spend_records` .
@@ -16,6 +17,9 @@ use crate::domain::usage_accounting::{CostStatus, FinalizedAccounting, UsageEvid
 /// Monetary value (`cost_nano_usd`) is stored as integer nano-USD.
 #[derive(Debug, Clone)]
 pub struct SpendRecord {
+    /// The request this row accounts for, stored as the row's `id`. A request produces at most
+    /// one row, so the ID is also the row's identity.
+    pub request_id: RequestId,
     pub org_id: String,
     pub identity_id: String,
     pub model: String,
@@ -39,6 +43,7 @@ pub struct SpendRecord {
 impl SpendRecord {
     /// Build a SpendRecord from the completed-request context.
     ///
+    /// `request_id` — minted by the request-ID Tower layer; becomes the row's `id`.
     /// `identity`   — injected by the auth+tagger Tower layers.
     /// `model`      — actual model returned in the provider response (not the requested model).
     /// `provider`   — name from `ProviderMetadata::name`.
@@ -48,6 +53,7 @@ impl SpendRecord {
     ///                computations.
     /// `latency_ms` — wall-clock milliseconds from handler entry to provider response.
     pub fn build(
+        request_id: RequestId,
         identity: &RequestIdentity,
         model: &str,
         provider: &str,
@@ -56,6 +62,7 @@ impl SpendRecord {
     ) -> Self {
         let token_usage = &accounting.token_usage;
         Self {
+            request_id,
             org_id: identity.org_id.clone(),
             identity_id: identity.id.clone(),
             model: model.to_owned(),
@@ -150,7 +157,14 @@ mod tests {
         };
         let mut accounting = finalized(token_usage, cost);
         accounting.evidence = accounting.token_usage.cache_write.to_evidence(0);
-        let record = SpendRecord::build(&identity, "gpt-4.1", "openai", &accounting, 123);
+        let record = SpendRecord::build(
+            RequestId::mint(),
+            &identity,
+            "gpt-4.1",
+            "openai",
+            &accounting,
+            123,
+        );
 
         assert_eq!(record.org_id, "acme");
         assert_eq!(record.identity_id, "key-123");
@@ -206,8 +220,10 @@ mod tests {
         let mut incomplete = finalized(TokenUsage::default(), cost);
         incomplete.evidence = Some(evidence_of(true));
 
-        let complete_record = SpendRecord::build(&identity, "m", "p", &complete, 10);
-        let incomplete_record = SpendRecord::build(&identity, "m", "p", &incomplete, 10);
+        let complete_record =
+            SpendRecord::build(RequestId::mint(), &identity, "m", "p", &complete, 10);
+        let incomplete_record =
+            SpendRecord::build(RequestId::mint(), &identity, "m", "p", &incomplete, 10);
 
         // Sanity: the fixtures actually differ in evidence completeness — otherwise this test
         // would pass vacuously.
@@ -255,6 +271,7 @@ mod tests {
             tags,
         };
         let record = SpendRecord::build(
+            RequestId::mint(),
             &identity,
             "m",
             "p",

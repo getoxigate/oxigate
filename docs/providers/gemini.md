@@ -143,11 +143,16 @@ The Gemini adapter supports `POST /v1/embeddings` with automatic single/batch di
 
 ### Supported embedding models
 
+> **Known gap:** no Gemini embedding model is in the adapter's default model list. Google's
+> current embedding model, `gemini-embedding-2`, is priced in the bundled snapshot, but the
+> adapter does not yet speak its protocol: it sends a `taskType` the model does not accept, and it
+> reads token usage from `embedding.statistics.tokenCount`, whereas the model reports it in
+> `usageMetadata.promptTokenCount`. A request that succeeded would therefore be recorded at zero
+> cost. Do not add the model through `supported_models` until this is fixed.
+
 | Model | Dimensions | Max input tokens |
 |-------|-----------|-----------------|
-| `text-embedding-004` | 768 | 2048 |
-| `gemini-embedding-exp-03-07` | 3072 | 2048 |
-| `text-multilingual-embedding-002` | 768 | 2048 |
+| `gemini-embedding-2` (not yet supported) | 3072 | 8192 |
 
 ### Single vs batch dispatch (API-key mode)
 
@@ -188,6 +193,9 @@ All requests use `taskType: "RETRIEVAL_DOCUMENT"` (constant `GEMINI_DEFAULT_TASK
 
 | Date | Change |
 |------|--------|
+| 2026-10-10 | The health probe checks the configured `default_model` (default `gemini-3.8-flash`) instead of a fixed model name |
+| 2026-10-10 | `gemini-2.5-pro`, `gemini-2.5-flash` and `gemini-2.5-flash-lite` leave the default model list: Vertex AI retires them on 2026-10-20 (replacements: `gemini-3.8-flash`, `gemini-3.1-flash-lite`). They stay priced, so a Gemini API deployment that still uses them can name them in `supported_models`. `supported_models` replaces the default list rather than extending it: list every other Gemini model you still want too, and add new releases yourself |
+| 2026-10-10 | **Upgrade note.** `text-embedding-004`, `text-multilingual-embedding-002` and `gemini-embedding-exp-03-07` are no longer in the bundled pricing snapshot. Google has shut the first and last down on the Gemini API; Vertex serves `text-embedding-004` and `text-multilingual-embedding-002` until 2027-04-01. If your `supported_models` still names either, their requests are recorded at zero cost (reported as cost-unavailable) unless you add a `pricing.overrides` entry for them. Their replacement, `gemini-embedding-2`, is priced but not yet supported by the embeddings path — see *Supported embedding models* |
 | 2026-09-03 | Model-specific cache-read multipliers imported into the bundled pricing snapshot. Cached prompt tokens are charged at their discounted rate instead of the full input rate |
 | 2026-08-23 | Cached prompt tokens no longer charged twice, and no longer double-counted for tier selection. Cost drops sharply on cached prompts |
 | 2026-05-09 | batchEmbedContents, embed_api_version, tokenCount parsing, EmbeddingCapabilities |

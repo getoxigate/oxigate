@@ -1,0 +1,46 @@
+[package]
+name = "spend-capture"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Records provider HTTP traffic at the gateway's upstream boundary and replays it"
+repository = "https://github.com/getoxigate/oxigate"
+publish = false
+
+# No normal dependency on the `oxigate` crate: the harness observes the gateway from outside, at
+# the HTTP boundary, and shares no code with what it observes.
+[dependencies]
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+# Plain hyper rather than reqwest on the forwarding path: reqwest adds default request headers,
+# and the capture must forward exactly the headers the gateway sent.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "server-graceful", "tokio"] }
+miette = { version = "7", features = ["fancy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+secrecy = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+# The same bundled roots the gateway trusts through reqwest's `rustls-tls`.
+webpki-roots = "1"
+
+[dev-dependencies]
+# Serves the in-process gateway to the gateway-in-the-loop test.
+axum = "0.8"
+futures = "0.3"
+# The gateway, in process, drives requests through the harness. Dev-only: the harness itself
+# shares no code with it.
+oxigate = { path = ".." }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+# A never-connecting Postgres pool for the in-process gateway's state.
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
+tempfile = "3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

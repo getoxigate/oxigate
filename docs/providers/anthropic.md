@@ -128,12 +128,13 @@ than asserting or silently dropping the difference — see
 
 ## Cache Token Pricing
 
-Anthropic supports differential pricing for cache tokens:
+Anthropic supports differential pricing for cache tokens. The multipliers below are the bundled
+snapshot's, set per model tier:
 
 | Token Type | Rate | Multiplier |
 |------------|------|------------|
 | Input (plain) | Base rate | 1.0× |
-| Cache Read | Discounted | 0.1× (90% discount) |
+| Cache Read | Discounted | 0.1× on most models; 0.05× on Claude Opus 5.5 and Sonnet 5.5; 0.025× on Claude Fable 5.1 and Mythos 5.1 |
 | Cache Write (5m TTL) | Premium | 1.25× |
 | Cache Write (1h TTL) | More Premium | 2.0× |
 
@@ -172,7 +173,7 @@ Total Cost =
   (input_tokens × input_rate) +
   ((output_tokens - thinking_tokens) × output_rate) +
   (thinking_tokens × thinking_rate) +
-  (cache_read_tokens × input_rate × 0.1) +
+  (cache_read_tokens × input_rate × cache_read_multiplier) +
   Σ over each accounted cache-write class c:
     (tokens[c] × input_rate × multiplier[c])
 ```

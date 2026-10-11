@@ -1057,14 +1057,14 @@ async fn compat_mistral_routes_and_tracks_cost() {
 #[tokio::test]
 async fn compat_groq_routes_and_tracks_cost() {
     // real URL: https://api.groq.com/openai — wiremock substitutes in the test
-    assert_compat_cost_tracked("llama-3.3-70b-versatile", "groq").await;
+    assert_compat_cost_tracked("openai/gpt-oss-120b", "groq").await;
 }
 
 /// AC1/AC2: Together AI request is forwarded and cost is tracked.
 #[tokio::test]
 async fn compat_together_ai_routes_and_tracks_cost() {
     // real URL: https://api.together.xyz — wiremock substitutes in the test
-    assert_compat_cost_tracked("meta-llama/Llama-3.3-70B-Instruct-Turbo", "together-ai").await;
+    assert_compat_cost_tracked("meta-models/Muse-Glimmer-30B", "together-ai").await;
 }
 
 /// AC1: DeepSeek-V4 Pro chat request is forwarded and cost is tracked.
@@ -1082,10 +1082,10 @@ async fn compat_deepseek_v4_flash_routes_and_tracks_cost() {
 
     let mock = wiremock::MockServer::start().await;
     // 100,000 prompt tokens, 50,000 of which are cached; 20,000 completion tokens. Deliberately
-    // large: at deepseek-v4-flash's rate (1.4e-7 USD/token) the gap between the correct 0.02
-    // multiplier and the retired 0.1 multiplier is only ~5.6e-8 USD at small token counts —
+    // large: at deepseek-v4-flash's rate (3e-7 USD/token) the gap between the correct 0.02
+    // multiplier and the retired 0.1 multiplier is only ~1.2e-7 USD at small token counts —
     // smaller than the cost header's 6-decimal-place (1e-6 USD) rounding floor, so a small-count
-    // test cannot actually distinguish the two. At this scale the gap widens to ~5.6e-4 USD.
+    // test cannot actually distinguish the two. At this scale the gap widens to ~1.2e-3 USD.
     wiremock_stubs::stub_openai_chat_with_cache(
         &mock,
         "deepseek-v4-flash",
@@ -1133,17 +1133,17 @@ async fn compat_deepseek_v4_flash_routes_and_tracks_cost() {
         .expect("X-Oxigate-Request-Cost header must be present");
     let actual_usd: f64 = cost_str.parse().expect("cost header must be valid f64");
 
-    // deepseek-v4-flash: input=1.4e-7 USD/token, output=2.8e-7 USD/token, cache_read_multiplier=0.02
+    // deepseek-v4-flash: input=3e-7 USD/token, output=1.2e-6 USD/token, cache_read_multiplier=0.02
     // mock: 100,000 prompt (50,000 cached), 20,000 completion; Inclusive accounting →
     // non-cached input_tokens = 50,000
-    // expected = 50,000 * 1.4e-7 * 0.02  (cached input at 2% rate)
-    //          + 50,000 * 1.4e-7         (non-cached input)
-    //          + 20,000 * 2.8e-7         (output)
-    //          = 0.01274 USD
+    // expected = 50,000 * 3e-7 * 0.02  (cached input at 2% rate)
+    //          + 50,000 * 3e-7         (non-cached input)
+    //          + 20,000 * 1.2e-6       (output)
+    //          = 0.0393 USD
     // Tolerance: 5e-6, comfortably above 6-decimal-place header rounding noise (max 5e-7) and
-    // comfortably below the ~5.6e-4 USD gap to the retired 0.1 multiplier (0.0133 USD) — see the
+    // comfortably below the ~1.2e-3 USD gap to the retired 0.1 multiplier (0.0405 USD) — see the
     // stub call above for why small token counts can't make this assertion discriminative.
-    let expected_usd = 50_000.0 * 1.4e-7 * 0.02 + 50_000.0 * 1.4e-7 + 20_000.0 * 2.8e-7;
+    let expected_usd = 50_000.0 * 3e-7 * 0.02 + 50_000.0 * 3e-7 + 20_000.0 * 1.2e-6;
     assert!(
         (actual_usd - expected_usd).abs() < 5e-6,
         "deepseek-v4-flash cost must reflect cache_read_multiplier 0.02: \
@@ -1226,14 +1226,14 @@ async fn compat_glm5_applies_cache_read_multiplier() {
 #[tokio::test]
 async fn compat_xai_routes_and_tracks_cost() {
     // real URL: https://api.x.ai/v1 — wiremock substitutes in the test
-    assert_compat_cost_tracked("grok-3-latest", "xai").await;
+    assert_compat_cost_tracked("grok-4.3", "xai").await;
 }
 
 /// Cerebras request is forwarded and cost is tracked.
 #[tokio::test]
 async fn compat_cerebras_routes_and_tracks_cost() {
     // real URL: https://api.cerebras.ai/v1 — wiremock substitutes in the test
-    assert_compat_cost_tracked("llama-3.3-70b", "cerebras").await;
+    assert_compat_cost_tracked("gpt-oss-120b", "cerebras").await;
 }
 
 /// AC2 / / /: All compat providers share the same streaming path.
@@ -1244,7 +1244,7 @@ async fn compat_streaming_sse_chunks_forwarded() {
     let redis = RedisContainer::start().await.expect("redis must start");
 
     let mock = wiremock::MockServer::start().await;
-    wiremock_stubs::stub_openai_stream(&mock, "llama-3.3-70b-versatile").await;
+    wiremock_stubs::stub_openai_stream(&mock, "openai/gpt-oss-120b").await;
 
     let provider = Arc::new(
         OpenAICompatAdapter::new(
@@ -1265,7 +1265,7 @@ async fn compat_streaming_sse_chunks_forwarded() {
     let gateway = TestGateway::spawn(pg.pool.clone(), redis.pool.clone(), provider).await;
 
     let body = serde_json::json!({
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "messages": [{"role": "user", "content": "Hello"}],
         "stream": true
     });
@@ -1327,7 +1327,7 @@ async fn groq_429_updates_cooldown_state() {
                 name: "groq".to_string(),
                 base_url: mock.uri().trim_end_matches('/').to_string(),
                 api_key: None,
-                supported_models: Some(vec!["llama-3.3-70b-versatile".to_string()]),
+                supported_models: Some(vec!["openai/gpt-oss-120b".to_string()]),
                 stream_options_support: true,
                 supports_tools: true,
                 timeout_secs: None,
@@ -1362,7 +1362,7 @@ async fn groq_429_updates_cooldown_state() {
     let gateway = TestGateway::spawn(pg.pool.clone(), redis.pool.clone(), Arc::new(router)).await;
 
     let body = serde_json::json!({
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "messages": [{"role": "user", "content": "Hello"}]
     });
 
@@ -1382,7 +1382,7 @@ async fn groq_429_updates_cooldown_state() {
         .candidates(
             &[adapter],
             &HashMap::new(),
-            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b",
             &pricing_db,
         )
         .await;

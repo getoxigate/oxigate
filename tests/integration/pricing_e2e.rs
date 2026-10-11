@@ -249,8 +249,8 @@ async fn openai_cached_tokens_discount_applied() {
     );
 }
 
-/// Verifies Gemini tiered pricing: requests above 128k tokens use tier-2 rate.
-/// gemini-1.5-pro-002 tier 0: 0–128k @ 1.25/1M input; tier 1: 128k+ @ 2.5/1M input.
+/// Verifies Gemini tiered pricing: requests above 200k tokens use tier-2 rate.
+/// gemini-2.5-pro tier 0: 0–200k @ 1.25/1M input; tier 1: 200k+ @ 2.5/1M input.
 #[tokio::test]
 async fn gemini_tiered_pricing_applies_higher_rate() {
     let pg = PgContainer::start().await.expect("pg container must start");
@@ -260,9 +260,9 @@ async fn gemini_tiered_pricing_applies_higher_rate() {
 
     let mock = wiremock::MockServer::start().await;
     // Tier 0: 1000 input tokens
-    wiremock_stubs::stub_openai_chat_once(&mock, "gemini-1.5-pro", 1000, 100).await;
-    // Tier 1: 150000 input tokens (>128k threshold)
-    wiremock_stubs::stub_openai_chat(&mock, "gemini-1.5-pro", 150_000, 100).await;
+    wiremock_stubs::stub_openai_chat_once(&mock, "gemini-2.5-pro", 1000, 100).await;
+    // Tier 1: 250000 input tokens (>200k threshold)
+    wiremock_stubs::stub_openai_chat(&mock, "gemini-2.5-pro", 250_000, 100).await;
 
     let provider = Arc::new(
         OpenAICompatAdapter::new(
@@ -283,7 +283,7 @@ async fn gemini_tiered_pricing_applies_higher_rate() {
     let gateway = TestGateway::spawn(pg.pool.clone(), redis.pool.clone(), provider).await;
 
     let body = serde_json::json!({
-        "model": "gemini-1.5-pro",
+        "model": "gemini-2.5-pro",
         "messages": [{"role": "user", "content": "Hello"}]
     });
 
@@ -317,9 +317,10 @@ async fn gemini_tiered_pricing_applies_higher_rate() {
         .and_then(|s| s.parse().ok())
         .expect("request cost header present");
 
-    // Tier 0: 1000*1.25/1M + 100*5/1M ≈ 0.00175. Tier 1: 150000*2.5/1M + 100*10/1M ≈ 0.376
+    // Tier 0: 1000*1.25/1M + 100*10/1M ≈ 0.00225. Tier 1: 250000*2.5/1M + 100*15/1M ≈ 0.627
+    // (the same tokens at the tier-0 rate would cost ≈ 0.314, below the lower bound).
     assert!(
-        cost_tier1 > 0.3 && cost_tier1 < 0.5,
+        cost_tier1 > 0.5 && cost_tier1 < 0.75,
         "tier-1 cost must reflect higher rate: cost={cost_tier1}"
     );
     assert!(

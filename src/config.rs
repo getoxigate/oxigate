@@ -483,7 +483,7 @@ pub struct GeminiConfig {
     #[serde(skip)]
     pub vertex_base_url_override: Option<String>,
     /// Optional list of model IDs to report in ProviderMetadata.supported_models.
-    /// Defaults to the built-in KNOWN_GEMINI_MODELS list (excluding deprecated).
+    /// Defaults to the built-in KNOWN_GEMINI_MODELS list.
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
     /// Default thinking budget for Gemini 2.5 models. 0 = disable (opt-in), -1 = dynamic, N = explicit tokens.

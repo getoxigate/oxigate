@@ -121,14 +121,14 @@ Gateway vars: put in `.env` (docker-compose loads it automatically via `env_file
 curl -s -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Say hello"}]}' | jq .
+  -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"Say hello"}]}' | jq .
 # Expected: {"choices":[{"message":{"content":"Hello..."}}], "usage":{...}}
 
 # 2. Streaming chat
 curl -sN -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Count to 3"}],"stream":true}' \
+  -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"Count to 3"}],"stream":true}' \
   | grep -E 'data: \[DONE\]|event: oxigate\.usage'
 # Expected: `data: [DONE]` followed by `event: oxigate.usage` — the provider's terminator,
 #           then the gateway's own terminal event. The second line is the one that matters:
@@ -138,35 +138,38 @@ curl -sN -X POST http://localhost:8080/v1/chat/completions \
 curl -s -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"What is the weather in London?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}}]}' | jq .choices[0].message.tool_calls
+  -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"What is the weather in London?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}}]}' | jq .choices[0].message.tool_calls
 # Expected: [{"function":{"name":"get_weather","arguments":"..."}]
 
+# 4–4b. Embeddings — SKIP. No Gemini embedding model is supported yet: the adapter does not
+#       speak gemini-embedding-2's request and usage format (see docs/providers/gemini.md,
+#       "Supported embedding models"). Re-enable these checks when it does.
 # 4. Embeddings — single input
 curl -s -X POST http://localhost:8080/v1/embeddings \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"text-embedding-004","input":"Hello world"}' | jq '.data[0].embedding | length'
-# Expected: 768 (text-embedding-004 dimension)
+  -d '{"model":"gemini-embedding-2","input":"Hello world"}' | jq '.data[0].embedding | length'
+# Expected: 3072 (gemini-embedding-2 default dimension)
 
 # 4a. Embeddings — batch input (batchEmbedContents,)
 curl -s -X POST http://localhost:8080/v1/embeddings \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"text-embedding-004","input":["Hello world","Goodbye world"]}' | jq '{count: (.data | length), dim: (.data[0].embedding | length)}'
-# Expected: {"count":2,"dim":768}
+  -d '{"model":"gemini-embedding-2","input":["Hello world","Goodbye world"]}' | jq '{count: (.data | length), dim: (.data[0].embedding | length)}'
+# Expected: {"count":2,"dim":3072}
 
 # 4b. Embedding cost headers
 curl -s -D - -o /dev/null -X POST http://localhost:8080/v1/embeddings \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"text-embedding-004","input":"Hello world"}' | grep -i "X-Oxigate"
+  -d '{"model":"gemini-embedding-2","input":"Hello world"}' | grep -i "X-Oxigate"
 # Expected: X-Oxigate-Request-Cost: 0.000... (non-zero), X-Oxigate-Output-Tokens: 0
 
 # 5. Cost headers present (-D - dumps headers to stdout; -o /dev/null discards body)
 curl -s -D - -o /dev/null -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Hi"}]}' | grep -i X-Oxigate-Request-Cost
+  -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"Hi"}]}' | grep -i X-Oxigate-Request-Cost
 # Expected: X-Oxigate-Request-Cost: 0.000... (non-zero)
 
 # 6. Invalid model → clean error (not panic). response headers include all four cost headers.
@@ -181,21 +184,23 @@ curl -s -X POST http://localhost:8080/v1/chat/completions \
   -d '{"model":"gemini-does-not-exist","messages":[{"role":"user","content":"Hi"}]}' | jq .error
 # Expected: {"code":404,"message":"model not found: gemini-does-not-exist"}
 
-# 7. Streaming thinking tokens (Gemini 2.5 Pro — thinking is always on)
-# Note: Flash uses a dynamic thinking budget and may not emit completion_tokens_details
-# for simple prompts. Use Pro here for a deterministic assertion.
+# 7. Streaming thinking tokens (Gemini 3.x Pro — thinking cannot be turned off; the gateway
+#    sends thinkingLevel MEDIUM unless the request sets thinking_level)
+# Note: the default model list carries no thinkingBudget model (Gemini 2.5), so this section
+# covers only the thinkingLevel path. The thinkingBudget wire format is covered by the
+# Gemini integration tests.
 curl -sN -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"Solve: 17 * 23"}],"stream":true}' \
+  -d '{"model":"gemini-3.1-pro-preview","messages":[{"role":"user","content":"Solve: 17 * 23"}],"stream":true}' \
   | grep '"completion_tokens_details"'
 # Expected: data: {...,"usage":{"completion_tokens_details":{"reasoning_tokens":N},...}}
 
-# 8. Non-streaming thinking tokens (Gemini 2.5)
+# 8. Non-streaming thinking tokens (Gemini 3.x Pro)
 curl -s -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"Solve: 17 * 23"}]}' \
+  -d '{"model":"gemini-3.1-pro-preview","messages":[{"role":"user","content":"Solve: 17 * 23"}]}' \
   | jq '.usage.completion_tokens_details'
 # Expected: {"reasoning_tokens": N}
 ```
@@ -613,7 +618,7 @@ Expected:
 
 **Why:** Verifies a structured `"request completed"` log event is emitted for every request with required metadata fields.
 
-**Prerequisites:** Postgres + Redis running (section 1 or section 2). No other gateway on port 8080 — this section starts its own. At least one provider configured in `.env` — the curl in step 2 uses `gemini-2.5-flash` by default; substitute any configured model if Gemini is not available.
+**Prerequisites:** Postgres + Redis running (section 1 or section 2). No other gateway on port 8080 — this section starts its own. At least one provider configured in `.env` — the curl in step 2 uses `gemini-3.8-flash` by default; substitute any configured model if Gemini is not available.
 
 ```bash
 # 1. Start gateway and capture logs
@@ -627,7 +632,7 @@ sleep 3
 # 2. Send a test request — substitute model if Gemini is not configured
 curl -s -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Hi"}]}' | jq .
+  -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"Hi"}]}' | jq .
 
 # 3. Verify "request completed" span log exists with required fields
 python3 - <<'PY'
@@ -779,14 +784,14 @@ provider API key for any LiteLLM-supported provider (example below uses Groq —
 # Then restart: docker compose up -d  or  see section 2 for local restart.
 
 # ── 2. Start LiteLLM proxy (GROQ_API_KEY must be in environment) ──────────
-litellm --model groq/llama-3.1-8b-instant --port 4000 & echo $! > /tmp/litellm-smoke.pid
+litellm --model groq/openai/gpt-oss-20b --port 4000 & echo $! > /tmp/litellm-smoke.pid
 sleep 3
 
 # ── 3. Non-streaming — verify response and cost headers ────────────────────
 curl -s -D - -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"groq/llama-3.1-8b-instant","messages":[{"role":"user","content":"Say hi"}]}' \
+  -d '{"model":"groq/openai/gpt-oss-20b","messages":[{"role":"user","content":"Say hi"}]}' \
   | tee /tmp/litellm_smoke.txt
 # Expected: HTTP 200; OpenAI-format body; X-Oxigate-Cost-* headers with non-zero values
 
@@ -796,7 +801,7 @@ grep -i "x-oxigate" /tmp/litellm_smoke.txt
 curl -s -N -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OXIGATE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"groq/llama-3.1-8b-instant","messages":[{"role":"user","content":"Count to 3"}],"stream":true}' \
+  -d '{"model":"groq/openai/gpt-oss-20b","messages":[{"role":"user","content":"Count to 3"}],"stream":true}' \
   | grep 'data: \[DONE\]'
 # Expected: SSE chunks followed by data: [DONE]
 

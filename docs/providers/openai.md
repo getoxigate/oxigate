@@ -64,9 +64,9 @@ OpenAI's prompt-caching guide documents exactly one cache duration: "The only su
 reported quantity to a class, so the field is billed as a `30m` cache write at the selected tier's
 `30m` entry in `cache_write_multipliers`.
 
-**The rate is per model, not adapter-wide.** In the bundled pricing snapshot only the GPT-5.6
-family — `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-5.6-luna` — carries a `30m` multiplier, at
-**1.25×** the input rate, matching what OpenAI publishes on those model pages. Every other bundled
+**The rate is per model, not adapter-wide.** In the bundled pricing snapshot only the GPT-6
+family — `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna` — and the GPT-5.6 family —
+`gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-5.6-luna` — carry a `30m` multiplier, at **1.25×** the input rate, matching what OpenAI publishes for those models. Every other bundled
 OpenAI entry carries no cache-write multiplier at all; see [Models the snapshot does not price for
 cache writes](#models-the-snapshot-does-not-price-for-cache-writes) below.
 
@@ -148,6 +148,7 @@ counter. A client can still see it where the response body is passed through.
 
 | Date | Change |
 |------|--------|
+| 2026-10-10 | `o1-pro`, `o3`, `o3-pro` and `o4-mini` are priced, each with its OpenAI shutdown date. `o3` and `o4-mini` are back in the default model list. `o1-pro` and `o3-pro` leave it: OpenAI serves them on the Responses API only, and this adapter calls Chat Completions. `o1-mini` (shut down 2025-10-27) is not priced |
 | 2026-09-02 | `prompt_tokens_details.cache_write_tokens` billed as a `30m` cache write, net of the input charge. Cost rises on cache-writing requests to the bundled GPT-5.6 models (1.25× input); other bundled entries price no multiplier, so their billed total is unchanged and the request reports `rate-fallback` |
 | 2026-08-23 | Reasoning tokens no longer charged twice — declared as contained in `completion_tokens`. Cost drops on reasoning-heavy requests |
 | 2026-05-09 | embeddings() impl, EmbeddingCapabilities, cost headers for /v1/embeddings |

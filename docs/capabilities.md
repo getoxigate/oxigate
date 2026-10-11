@@ -35,6 +35,7 @@ Keep this matrix in sync with implementation whenever a capability row changes.
 | **Long-context tier selection**¹³ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Cost-confidence status**¹⁴ (`exact` / `reconciled` / `rate-fallback` / `cost-unavailable`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Mid-stream budget enforcement** | ❌¹⁵ | ✅ | ⚡⁹ | ❌¹⁵ | ❌¹⁵ |
+| **Request ID** (`X-Oxigate-Request-Id` on every response from a served `/v1` route; equals the request's `spend_records.id` — see `api.md`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 **Notes:**
 

@@ -49,15 +49,15 @@ const DEFAULT_MODEL: &str = "anthropic.claude-3-5-sonnet-20241022-v2:0";
 // Routing uses check_model_prefix (anthropic.* wildcard) — this list does NOT gate requests.
 // Operators can override via providers.bedrock.supported_models in config.
 // Update when AWS publishes new model IDs; missing entries here do not break routing.
+// These are the base model IDs Anthropic documents for Bedrock's InvokeModel / Converse
+// integration (platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy),
+// each priced by the bundled snapshot. The Claude 3.x IDs are gone: they are retired and unpriced.
 const KNOWN_BEDROCK_MODELS: &[&str] = &[
-    "anthropic.claude-opus-4-7-20251001-v1:0",
-    "anthropic.claude-sonnet-4-6-20251001-v1:0",
+    "anthropic.claude-opus-4-6-v1",
+    "anthropic.claude-opus-4-5-20251101-v1:0",
+    "anthropic.claude-sonnet-4-6",
+    "anthropic.claude-sonnet-4-5-20250929-v1:0",
     "anthropic.claude-haiku-4-5-20251001-v1:0",
-    "anthropic.claude-3-5-sonnet-20241022-v2:0",
-    "anthropic.claude-3-5-haiku-20241022-v1:0",
-    "anthropic.claude-3-opus-20240229-v1:0",
-    "anthropic.claude-3-sonnet-20240229-v1:0",
-    "anthropic.claude-3-haiku-20240307-v1:0",
 ];
 
 pub struct BedrockAdapter {
@@ -339,7 +339,7 @@ impl ProviderAdapter for BedrockAdapter {
         let model = self.model(&req.model);
         self.check_model_prefix(&model)?;
 
-        let request_id = req.request_id.as_deref().unwrap_or("unknown");
+        let request_id = &req.request_id_or_mint(&self.metadata().name);
         info!(model = %model, request_id = %request_id, "bedrock: chat_completion");
         let body = self.build_body(req)?;
         let url = self.converse_url(&model);
@@ -393,7 +393,7 @@ impl ProviderAdapter for BedrockAdapter {
         let model = self.model(&req.model);
         self.check_model_prefix(&model)?;
 
-        let request_id = req.request_id.as_deref().unwrap_or("unknown").to_string();
+        let request_id = req.request_id_or_mint(&self.metadata().name);
         info!(model = %model, request_id = %request_id, "bedrock: chat_completion_stream");
         let body = self.build_body(req)?;
         let url = self.converse_stream_url(&model);

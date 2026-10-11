@@ -218,11 +218,11 @@ async fn test_router_resolves_gpt_to_openai() {
 
 #[tokio::test]
 async fn test_router_resolves_gemini_to_google() {
-    let gemini = test_adapter("gemini", vec!["gemini-2.0-flash"]);
+    let gemini = test_adapter("gemini", vec!["gemini-3.8-flash"]);
     let router = make_router(vec![gemini]);
 
     let resp = router
-        .chat_completion(&make_request("gemini-2.0-flash"))
+        .chat_completion(&make_request("gemini-3.8-flash"))
         .await
         .unwrap();
     assert_eq!(

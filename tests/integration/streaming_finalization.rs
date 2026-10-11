@@ -13,8 +13,8 @@
 //!   captured process-wide and counted **only for this test's provider name**, so a test running
 //!   concurrently in the same process cannot contribute a line. This is what separates "finalized
 //!   once" from "finalized twice"; it is emitted synchronously, so it is readable as soon as the
-//!   response ends. The line's `request_id` cannot serve as the filter: the handler generates it
-//!   and a client cannot supply one, so a test has no way to know it in advance.
+//!   response ends. The line's `request_id`, which the response header also carries, would serve
+//!   as a filter too; the provider name is used because it filters the metric below as well.
 //! - **Metric (corroborating only).** `oxigate_cost_usd_total` is keyed by `(provider, endpoint)`
 //!   with no request dimension, so the scrape is filtered by that same provider name. Even
 //!   isolated, a counter records a sum and not a call count: a matching delta corroborates the row

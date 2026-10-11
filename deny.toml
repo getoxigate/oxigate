@@ -1,0 +1,75 @@
+# `cargo deny check` policy for this workspace. `cargo audit` reads its own
+# policy from .cargo/audit.toml.
+#
+# Scope: `cargo xtask audit` runs `cargo deny --workspace check`, which checks
+# every workspace member (`oxigate`, `xtask`, `spend-capture`) with every
+# feature (all-features below) and dev-dependencies included.
+
+[graph]
+targets = []
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+version = 2
+# An advisory is ignored only when no fixed version exists and the crate is
+# absent from the release binary (`cargo tree -e normal -i <crate>` prints
+# nothing). cargo audit reads the whole lockfile and keeps its own list in
+# .cargo/audit.toml; this one covers the resolved graph, dev-dependencies
+# included.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa: no fixed release; dev-dependency only (Gemini auth test keys), not linked into the gateway binary" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+# Permissive licenses only. Any dependency under a license not listed here,
+# copyleft included, fails the check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+]
+# This project's own crates, each exempted by name so the allow-list above still
+# rejects a third-party crate under the same license. A new workspace member
+# needs its own entry.
+exceptions = [
+    { crate = "oxigate", allow = ["AGPL-3.0-or-later"] },
+    { crate = "spend-capture", allow = ["AGPL-3.0-or-later"] },
+    { crate = "xtask", allow = ["AGPL-3.0-or-later"] },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# spend-capture (publish = false) depends on the gateway by path, with no
+# version, for its tests. Applies only to path dependencies of unpublished
+# crates.
+allow-wildcard-paths = true
+deny = [
+    # Backs the rsa advisory ignore above: fails if any crate other than
+    # `oxigate` itself (where rsa is a dev-dependency) pulls rsa in, e.g. a
+    # transitive dependency reaching the binary. It cannot tell oxigate's dev
+    # and normal dependencies apart, so adding rsa to oxigate's
+    # [dependencies] still needs a reviewer.
+    { crate = "rsa", wrappers = ["oxigate"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

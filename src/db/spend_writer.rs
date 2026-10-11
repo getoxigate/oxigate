@@ -167,12 +167,13 @@ pub async fn write_spend(
         let result = sqlx::query(
             r#"
             INSERT INTO spend_records
-                (org_id, identity_id, model, provider,
+                (id, org_id, identity_id, model, provider,
                  prompt_tokens, completion_tokens, cache_read_tokens, thinking_tokens,
                  cost_nano_usd, cost_status, usage_evidence, latency_ms, tags)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
         )
+        .bind(record.request_id.as_uuid())
         .bind(&record.org_id)
         .bind(&record.identity_id)
         .bind(&record.model)
@@ -189,9 +190,12 @@ pub async fn write_spend(
         .execute(&db)
         .await;
 
+        // A second write under an existing request ID lands here too: the primary key rejects it,
+        // so the stored row is never overwritten or duplicated.
         if let Err(e) = result {
             tracing::error!(
                 error = %e,
+                request_id = %record.request_id,
                 org_id = %record.org_id,
                 identity_id = %record.identity_id,
                 "spend_writer: Postgres INSERT failed"

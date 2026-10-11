@@ -19,6 +19,7 @@ use crate::api::AppState;
 use crate::domain::auth::RequestIdentity;
 use crate::domain::embedding::EmbeddingRequest;
 use crate::domain::ports::{AttemptedMeta, ProviderError};
+use crate::domain::request_id::RequestId;
 use crate::domain::spend::SpendRecord;
 use crate::middleware::request_metrics::ProviderLabel;
 use crate::observability::metrics::{
@@ -142,6 +143,7 @@ fn record_embedding_metrics(provider: &str, latency_secs: f64, status: Embedding
 pub async fn embeddings(
     State(state): State<AppState>,
     Extension(identity): Extension<RequestIdentity>,
+    Extension(request_id): Extension<RequestId>,
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<impl IntoResponse, EmbeddingsError> {
     let request_start = std::time::Instant::now();
@@ -155,7 +157,6 @@ pub async fn embeddings(
         ));
     }
 
-    let request_id = uuid::Uuid::new_v4().to_string();
     let provider_label = provider.metadata().name.to_string();
 
     // Destructure dispatch result into a uniform (embed_result, provider_name, meta) triple.
@@ -212,13 +213,14 @@ pub async fn embeddings(
                     false,
                 );
                 crate::utils::cost_headers::report_finalized_warning(
-                    &request_id,
+                    &request_id.to_string(),
                     &model_used,
                     &accounting,
                 );
                 let cost_usd = accounting.cost.total_cost.to_display_string();
 
                 let record = SpendRecord::build(
+                    request_id,
                     &identity,
                     &model_used,
                     &provider_name,
@@ -229,7 +231,6 @@ pub async fn embeddings(
                 crate::api::spawn_cost_log_and_spend(
                     "embedding_cost",
                     record,
-                    &request_id,
                     &cost_usd,
                     Arc::clone(&state.pool),
                     Arc::clone(&state.redis_pool),

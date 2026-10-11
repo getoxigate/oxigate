@@ -7,6 +7,7 @@ pub mod chat;
 pub mod embedding;
 pub mod ports;
 pub mod pricing;
+pub mod request_id;
 pub mod routing;
 pub mod spend;
 pub mod tool_schema;

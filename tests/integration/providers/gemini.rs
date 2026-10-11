@@ -94,7 +94,7 @@ async fn gemini_config_api(mock_base: &str) -> GeminiConfig {
         vertex_project: None,
         vertex_location: None,
         vertex_service_account_json: None,
-        default_model: Some("gemini-2.0-flash".into()),
+        default_model: Some("gemini-3.8-flash".into()),
         timeout_secs: Some(10),
         api_base_url: Some(mock_base.to_string()),
         vertex_base_url_override: None,
@@ -107,7 +107,7 @@ async fn gemini_config_api(mock_base: &str) -> GeminiConfig {
 #[tokio::test]
 async fn test_gemini_api_chat_completion() {
     let mock = MockServer::start().await;
-    let path_pattern = "/v1beta/models/gemini-2.0-flash:generateContent";
+    let path_pattern = "/v1beta/models/gemini-3.8-flash:generateContent";
     let body = gemini_chat_response(5, 10, "Hello from Gemini", "STOP");
     Mock::given(method("POST"))
         .and(path(path_pattern))
@@ -121,7 +121,7 @@ async fn test_gemini_api_chat_completion() {
         .expect("adapter must build");
 
     let req = ChatRequest {
-        model: "gemini-2.0-flash".into(),
+        model: "gemini-3.8-flash".into(),
         messages: vec![Message {
             role: Role::User,
             content: Some(MessageContent::Text("Hi".into())),
@@ -156,7 +156,7 @@ async fn test_gemini_api_chat_completion() {
 #[tokio::test]
 async fn test_gemini_streaming_chunk_order() {
     let mock = MockServer::start().await;
-    let path_pattern = "/v1beta/models/gemini-2.0-flash:streamGenerateContent";
+    let path_pattern = "/v1beta/models/gemini-3.8-flash:streamGenerateContent";
     let ndjson = gemini_stream_chunk("Hello", "STOP");
     Mock::given(method("POST"))
         .and(path(path_pattern))
@@ -174,7 +174,7 @@ async fn test_gemini_streaming_chunk_order() {
         .expect("adapter must build");
 
     let req = ChatRequest {
-        model: "gemini-2.0-flash".into(),
+        model: "gemini-3.8-flash".into(),
         messages: vec![Message {
             role: Role::User,
             content: Some(MessageContent::Text("Hi".into())),
@@ -211,7 +211,7 @@ async fn test_gemini_streaming_chunk_order() {
 #[tokio::test]
 async fn test_gemini_function_calling() {
     let mock = MockServer::start().await;
-    let path_pattern = "/v1beta/models/gemini-2.0-flash:generateContent";
+    let path_pattern = "/v1beta/models/gemini-3.8-flash:generateContent";
     let body = serde_json::json!({
         "candidates": [{
             "content": {
@@ -243,7 +243,7 @@ async fn test_gemini_function_calling() {
         .expect("adapter must build");
 
     let req = ChatRequest {
-        model: "gemini-2.0-flash".into(),
+        model: "gemini-3.8-flash".into(),
         messages: vec![Message {
             role: Role::User,
             content: Some(MessageContent::Text("Weather in London?".into())),
@@ -283,7 +283,7 @@ async fn test_gemini_function_calling() {
 #[tokio::test]
 async fn test_gemini_429_is_retriable() {
     let mock = MockServer::start().await;
-    let path_pattern = "/v1beta/models/gemini-2.0-flash:generateContent";
+    let path_pattern = "/v1beta/models/gemini-3.8-flash:generateContent";
     Mock::given(method("POST"))
         .and(path(path_pattern))
         .respond_with(
@@ -300,7 +300,7 @@ async fn test_gemini_429_is_retriable() {
         .expect("adapter must build");
 
     let req = ChatRequest {
-        model: "gemini-2.0-flash".into(),
+        model: "gemini-3.8-flash".into(),
         messages: vec![Message {
             role: Role::User,
             content: Some(MessageContent::Text("Hi".into())),
@@ -380,7 +380,7 @@ async fn test_gemini_404_unknown_model() {
 #[tokio::test]
 async fn test_gemini_safety_block_mapped_to_content_filtered() {
     let mock = MockServer::start().await;
-    let path_pattern = "/v1beta/models/gemini-2.0-flash:generateContent";
+    let path_pattern = "/v1beta/models/gemini-3.8-flash:generateContent";
     let body = serde_json::json!({
         "candidates": [{
             "content": null,
@@ -400,7 +400,7 @@ async fn test_gemini_safety_block_mapped_to_content_filtered() {
         .expect("adapter must build");
 
     let req = ChatRequest {
-        model: "gemini-2.0-flash".into(),
+        model: "gemini-3.8-flash".into(),
         messages: vec![Message {
             role: Role::User,
             content: Some(MessageContent::Text("Hi".into())),
@@ -430,7 +430,7 @@ async fn test_gemini_safety_block_mapped_to_content_filtered() {
 #[tokio::test]
 async fn test_gemini_embeddings() {
     let mock = MockServer::start().await;
-    let path_pattern = "/v1/models/text-embedding-004:embedContent";
+    let path_pattern = "/v1/models/gemini-embedding-2:embedContent";
     let body = gemini_embed_response(&[0.1, -0.2, 0.3]);
     Mock::given(method("POST"))
         .and(path(path_pattern))
@@ -444,7 +444,7 @@ async fn test_gemini_embeddings() {
         .expect("adapter must build");
 
     let req = EmbeddingRequest {
-        model: "text-embedding-004".into(),
+        model: "gemini-embedding-2".into(),
         input: EmbeddingInput::Single("hello world".into()),
         ..Default::default()
     };
@@ -457,7 +457,7 @@ async fn test_gemini_embeddings() {
     assert!(!resp.data[0].embedding.is_empty());
     // OpenAI compatibility: object and model at top level, object in each data item
     assert_eq!(resp.object, "list");
-    assert_eq!(resp.model, "text-embedding-004");
+    assert_eq!(resp.model, "gemini-embedding-2");
     assert_eq!(resp.data[0].object, "embedding");
 }
 
@@ -467,7 +467,7 @@ async fn test_vertex_chat_completion() {
     let mock_uri = mock.uri();
     let mock_base = mock_uri.trim_end_matches('/');
     let token_uri = format!("{}/token", mock_base);
-    let vertex_path = "/v1/projects/test-proj/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent";
+    let vertex_path = "/v1/projects/test-proj/locations/us-central1/publishers/google/models/gemini-3.8-flash:generateContent";
 
     // OAuth token exchange
     Mock::given(method("POST"))
@@ -501,7 +501,7 @@ async fn test_vertex_chat_completion() {
         vertex_project: Some("test-proj".into()),
         vertex_location: Some("us-central1".into()),
         vertex_service_account_json: Some(SecretString::new(sa_json.to_string())),
-        default_model: Some("gemini-2.0-flash".into()),
+        default_model: Some("gemini-3.8-flash".into()),
         timeout_secs: Some(10),
         api_base_url: None,
         vertex_base_url_override: Some(mock_base.to_string()),
@@ -515,7 +515,7 @@ async fn test_vertex_chat_completion() {
         .expect("adapter must build");
 
     let req = ChatRequest {
-        model: "gemini-2.0-flash".into(),
+        model: "gemini-3.8-flash".into(),
         messages: vec![Message {
             role: Role::User,
             content: Some(MessageContent::Text("Hi".into())),
@@ -720,9 +720,9 @@ async fn test_gemini_3x_thinking_level_in_request() {
 }
 
 #[tokio::test]
-async fn test_gemini_20_no_thinking_config_in_request() {
+async fn test_model_without_thinking_flags_gets_no_thinking_config() {
     let mock = MockServer::start().await;
-    let path_pattern = "/v1beta/models/gemini-2.0-flash:generateContent";
+    let path_pattern = "/v1beta/models/custom-tuned-gemini-v1:generateContent";
     let body = gemini_chat_response(5, 10, "Hello", "STOP");
     Mock::given(method("POST"))
         .and(path(path_pattern))
@@ -736,7 +736,7 @@ async fn test_gemini_20_no_thinking_config_in_request() {
         .expect("adapter must build");
 
     let req = ChatRequest {
-        model: "gemini-2.0-flash".into(),
+        model: "custom-tuned-gemini-v1".into(),
         messages: vec![Message {
             role: Role::User,
             content: Some(MessageContent::Text("Hi".into())),
@@ -768,7 +768,7 @@ async fn test_gemini_20_no_thinking_config_in_request() {
         .and_then(|g| g.get("thinkingConfig"));
     assert!(
         thinking_config.is_none(),
-        "gemini-2.0 must NOT receive thinkingConfig (Google returns 400)"
+        "a model without thinking flags must NOT receive thinkingConfig"
     );
 }
 
@@ -1178,7 +1178,7 @@ async fn test_gemini_marks_only_the_synthesized_terminator() {
     let ndjson = gemini_stream_chunk("Hello from Gemini", "STOP");
     Mock::given(method("POST"))
         .and(path(
-            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+            "/v1beta/models/gemini-3.8-flash:streamGenerateContent",
         ))
         .and(query_param("alt", "sse"))
         .respond_with(
@@ -1194,7 +1194,7 @@ async fn test_gemini_marks_only_the_synthesized_terminator() {
         .expect("adapter must build");
 
     let req = ChatRequest {
-        model: "gemini-2.0-flash".into(),
+        model: "gemini-3.8-flash".into(),
         messages: vec![Message {
             role: Role::User,
             content: Some(MessageContent::Text("Hi".into())),
@@ -1240,7 +1240,7 @@ async fn test_gemini_leaves_the_terminator_unmarked_after_a_failed_trailing_read
     body.extend_from_slice(&[0xff, 0xfe, b'\n']);
     Mock::given(method("POST"))
         .and(path(
-            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+            "/v1beta/models/gemini-3.8-flash:streamGenerateContent",
         ))
         .and(query_param("alt", "sse"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"))
@@ -1253,7 +1253,7 @@ async fn test_gemini_leaves_the_terminator_unmarked_after_a_failed_trailing_read
         .expect("adapter must build");
 
     let req = ChatRequest {
-        model: "gemini-2.0-flash".into(),
+        model: "gemini-3.8-flash".into(),
         messages: vec![Message {
             role: Role::User,
             content: Some(MessageContent::Text("Hi".into())),

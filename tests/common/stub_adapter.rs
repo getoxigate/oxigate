@@ -243,6 +243,91 @@ impl ProviderAdapter for StreamStubAdapter {
 
 impl ProviderAdapterExt for StreamStubAdapter {}
 
+/// Stub adapter that keeps the `request_id` of every chat request handed to it, buffered or
+/// streamed, and answers with a minimal successful reply.
+///
+/// It sits exactly where every gateway path hands a request to a provider, so a test can assert
+/// the gateway wired its request ID through. A feature that adds a new way of dispatching chat
+/// requests should drive this adapter in its own tests for the same check.
+pub struct InspectingStubAdapter {
+    metadata: ProviderMetadata,
+    seen: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+impl InspectingStubAdapter {
+    /// Creates the adapter. Keep an `Arc` clone to read [`Self::seen_request_ids`] afterwards.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            metadata: ProviderMetadata {
+                name: "inspecting-stub".to_string(),
+                supported_models: vec!["*".to_string()],
+                supports_streaming: true,
+                ..Default::default()
+            },
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The `request_id` of each chat request received, in arrival order.
+    pub fn seen_request_ids(&self) -> Vec<Option<String>> {
+        self.seen
+            .lock()
+            .expect("seen store is not poisoned")
+            .clone()
+    }
+
+    fn record(&self, req: &ChatRequest) {
+        self.seen
+            .lock()
+            .expect("seen store is not poisoned")
+            .push(req.request_id.clone());
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for InspectingStubAdapter {
+    async fn chat_completion(&self, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+        self.record(req);
+        Ok(ChatResponse {
+            id: "chatcmpl-inspecting-stub".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: req.model.clone(),
+            choices: vec![],
+            usage: Default::default(),
+        })
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        req: &ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamChunk, ProviderError>> + Send>,
+        >,
+        ProviderError,
+    > {
+        self.record(req);
+        let chunk = StreamChunk::new(
+            bytes::Bytes::from("data: {\"choices\":[]}\n\n"),
+            None,
+            Some(req.model.clone()),
+        );
+        Ok(Box::pin(futures::stream::iter([Ok(chunk)])))
+    }
+
+    fn metadata(&self) -> &ProviderMetadata {
+        &self.metadata
+    }
+
+    async fn health_check(&self) -> HealthStatus {
+        HealthStatus::Healthy
+    }
+}
+
+impl ProviderAdapterExt for InspectingStubAdapter {}
+
 /// Stub adapter that returns Err from chat_completion_stream (pre-dispatch).
 /// Used to test zero-cost headers on streaming error path before any stream starts.
 pub struct FailingStreamStubAdapter {

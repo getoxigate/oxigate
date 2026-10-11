@@ -38,6 +38,7 @@ use crate::middleware::auth::AuthLayer;
 use crate::middleware::budget::{BudgetLayer, BudgetResponseLayer, BudgetRuntimeConfig};
 use crate::middleware::global_safety::{GlobalSafetyLayer, GlobalSafetyRuntimeConfig};
 use crate::middleware::hard_cap::HardCapLayer;
+use crate::middleware::request_id::RequestIdLayer;
 use crate::middleware::request_metrics::RequestMetricsLayer;
 use crate::middleware::tagger::TaggerLayer;
 use crate::middleware::team_tag_budget::{TeamTagBudgetLayer, TeamTagBudgetResponseLayer};
@@ -96,7 +97,7 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 50 * 1024 * 1024;
 ///   Router → BudgetResponseLayer → HardCapLayer → BudgetLayer
 ///          → TeamTagBudgetResponseLayer → TeamTagBudgetLayer
 ///          → TaggerLayer → AuthLayer → GlobalSafetyLayer → DefaultBodyLimit
-///          → RequestMetricsLayer → ActiveConnectionsLayer
+///          → RequestMetricsLayer → ActiveConnectionsLayer → RequestIdLayer
 pub fn router(state: AppState) -> Router {
     router_with_body_limit(state, MAX_REQUEST_BODY_BYTES)
 }
@@ -161,14 +162,16 @@ pub fn router_with_body_limit(state: AppState, max_request_body_bytes: usize) ->
                 Arc::clone(&state.budget_settings),
             ));
 
-    // Step 4 — auth + global safety + request metrics.
+    // Step 4 — auth + global safety + request metrics + request ID.
     // Layer declaration order (innermost → outermost):
     //   TaggerLayer             (innermost of this block)
     //   AuthLayer
     //   GlobalSafetyLayer
     //   DefaultBodyLimit        (outermost body check; rejects 413 before any middleware)
-    //   RequestMetricsLayer     (outermost: measures full e2e latency incl. auth + body limit)
-    //   ActiveConnectionsLayer  (outermost: counts connections for the full v1 scope)
+    //   RequestMetricsLayer     (measures full e2e latency incl. auth + body limit)
+    //   ActiveConnectionsLayer  (counts connections for the full v1 scope)
+    //   RequestIdLayer          (outermost: mints the request ID, so every response from a
+    //                            registered /v1 route carries it, rejections included)
     //
     // Note: DefaultBodyLimit rejects oversized bodies with 413 before other middleware.
     let v1_routes = v1_routes
@@ -181,6 +184,7 @@ pub fn router_with_body_limit(state: AppState, max_request_body_bytes: usize) ->
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .layer(RequestMetricsLayer::new())
         .layer(ActiveConnectionsLayer::new())
+        .layer(RequestIdLayer::new())
         .with_state(state.clone());
 
     Router::new()
@@ -247,14 +251,13 @@ pub(crate) fn inject_attempted_headers(
 pub(crate) fn spawn_cost_log_and_spend(
     event_name: &'static str,
     record: SpendRecord,
-    request_id: &str,
     cost_usd_display: &str,
     pool: Arc<RwLock<DbPool>>,
     redis: Arc<RwLock<RedisPool>>,
     budget: BudgetConfig,
 ) {
     tracing::info!(
-        request_id = %request_id,
+        request_id = %record.request_id,
         org_id = %record.org_id,
         identity_id = %record.identity_id,
         model = %record.model,

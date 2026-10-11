@@ -1404,11 +1404,12 @@ mod tests {
     /// dimension in `calculate` already refuses to do.
     #[test]
     fn geo_stated_without_a_rate_degrades_rather_than_billing_short() {
-        // An override for a model absent from the bundled asset: the entry it creates carries
+        // An override for a model absent from the bundled asset (an invented ID, so a refresh can
+        // never bundle it): the entry it creates carries
         // `provider: "override"`, not `anthropic`.
         let mut config = default_config();
         config.overrides.insert(
-            "claude-opus-4-7".into(),
+            "claude-unbundled-fixture".into(),
             PricingOverride {
                 input_per_token: 0.000005,
                 output_per_token: 0.000025,
@@ -1438,8 +1439,8 @@ mod tests {
         // provider-gated status would let an override entry emit that reason next to a
         // `cost-status: exact` header, contradicting the published provider doc.
         for (model, geo) in [
-            ("claude-opus-4-7", InferenceGeo::Us),
-            ("claude-opus-4-7", InferenceGeo::Other),
+            ("claude-unbundled-fixture", InferenceGeo::Us),
+            ("claude-unbundled-fixture", InferenceGeo::Other),
             ("claude-sonnet-4", InferenceGeo::Us),
             ("claude-sonnet-4", InferenceGeo::Other),
         ] {
@@ -1537,10 +1538,9 @@ mod tests {
     fn test_parse_bundled_json() {
         let db = PricingDb::load(BUNDLED_PRICING_JSON, &default_config()).unwrap();
         let guard = db.read();
-        // 2026-08-07 snapshot: 65 models (56 - 2 retired DeepSeek IDs + 11 new entries;
-        // see docs/changelog.md "Refresh bundled pricing snapshot"), minus 7: seven Anthropic
-        // entries retired by their vendor were removed from the bundled snapshot.
-        assert_eq!(guard.by_canonical.len(), 58);
+        // One canonical entry per bundled model. A refresh that adds or removes entries updates
+        // this count, so an accidental drop or duplicate shows up here.
+        assert_eq!(guard.by_canonical.len(), 86);
     }
 
     /// Every cache multiplier the Bedrock and OpenAI cache parsers price against is present, on

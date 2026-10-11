@@ -40,7 +40,20 @@ const REASONING_MODELS: &[&str] = &[
 ];
 
 /// Known OpenAI models for supported_models. Operators may override via config.
+///
+/// Every entry is priced by the bundled snapshot: a listed model the snapshot does not price is
+/// costed at zero. `o1-mini` is not listed: OpenAI shut it down on 2025-10-27 and the snapshot
+/// does not price it (developers.openai.com/api/docs/deprecations). `o1-pro` and `o3-pro` are
+/// priced but not listed: OpenAI serves them on the Responses API only, and this lane calls Chat
+/// Completions, so a request to them fails upstream.
 const KNOWN_OPENAI_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-4o",
     "gpt-4o-mini",
     "gpt-4.1",
@@ -51,11 +64,8 @@ const KNOWN_OPENAI_MODELS: &[&str] = &[
     "gpt-5-nano",
     "gpt-5.1",
     "o1",
-    "o1-mini",
-    "o1-pro",
     "o3",
     "o3-mini",
-    "o3-pro",
     "o4-mini",
 ];
 

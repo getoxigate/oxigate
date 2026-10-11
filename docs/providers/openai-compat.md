@@ -66,8 +66,7 @@ providers:
         - mistral-large-latest
         - mistral-small-latest
         - codestral-latest
-        - open-mistral-7b
-        - open-mixtral-8x7b
+        - ministral-8b-latest
       stream_options_support: false
       supports_tools: true
 ```
@@ -93,8 +92,8 @@ providers:
       base_url: https://api.groq.com/openai
       api_key: ${GROQ_API_KEY}
       supported_models:
-        - llama-3.3-70b-versatile
-        - llama-3.1-8b-instant
+        - openai/gpt-oss-120b
+        - openai/gpt-oss-20b
       stream_options_support: true
       supports_tools: true
 ```
@@ -120,8 +119,7 @@ providers:
       base_url: https://api.together.xyz
       api_key: ${TOGETHER_API_KEY}
       supported_models:
-        - meta-llama/Llama-3.3-70B-Instruct-Turbo
-        - meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo
+        - meta-models/Muse-Glimmer-30B
       stream_options_support: false
       supports_tools: true
 ```
@@ -132,7 +130,7 @@ providers:
 | `stream_options_support` | `false` |
 | `supports_tools` | `true` |
 
-**Notes:** Together AI uses namespace-qualified model IDs (e.g. `meta-llama/Llama-3.3-70B-Instruct-Turbo`).
+**Notes:** Together AI uses namespace-qualified model IDs (e.g. `meta-models/Muse-Glimmer-30B`).
 The gateway forwards the `model` field verbatim — no normalisation is applied. Ensure
 `supported_models` entries match the exact IDs sent by clients.
 
@@ -161,7 +159,7 @@ providers:
 
 **Notes:** cached prompt tokens are discounted relative to the standard input rate:
 `deepseek-v4-flash` carries `cache_read_multiplier: 0.02` (2 % of input rate) and
-`deepseek-v4-pro` carries `cache_read_multiplier: ≈0.008333` (1/120th of input rate). Usage
+`deepseek-v4-pro` carries `cache_read_multiplier: ≈0.033333` (1/30th of input rate). Usage
 fields follow the OpenAI schema; no Anthropic-style `cache_creation_input_tokens` is available.
 
 ---
@@ -175,8 +173,7 @@ providers:
       base_url: https://api.x.ai/v1
       api_key: ${XAI_API_KEY}
       supported_models:
-        - grok-3-latest
-        - grok-3-mini-latest
+        - grok-4.3
       stream_options_support: false
       supports_tools: true
 ```
@@ -187,9 +184,10 @@ providers:
 | `stream_options_support` | `false` |
 | `supports_tools` | `true` |
 
-**Notes:** `grok-3-latest` and `grok-3-mini-latest` carry `cache_read_multiplier: 0.25` — cached
-tokens cost 25 % of the standard input rate. xAI's first-class cache token breakdown, vision
-inputs, and reasoning model parameters require a native adapter.
+**Notes:** `grok-4.3` carries `cache_read_multiplier: 0.16` — cached tokens cost 16 % of the
+standard input rate. Requests above 200 k input tokens are priced at a higher rate. xAI's
+first-class cache token breakdown, vision inputs, and reasoning model parameters require a native
+adapter.
 
 ---
 
@@ -202,8 +200,7 @@ providers:
       base_url: https://api.cerebras.ai/v1
       api_key: ${CEREBRAS_API_KEY}
       supported_models:
-        - llama-3.3-70b
-        - llama3.1-8b
+        - gpt-oss-120b
       stream_options_support: false
       supports_tools: true
 ```

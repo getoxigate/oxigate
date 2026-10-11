@@ -7,6 +7,7 @@ pub mod auth;
 pub mod budget;
 pub mod global_safety;
 pub mod hard_cap;
+pub mod request_id;
 pub mod request_metrics;
 pub mod tagger;
 pub mod team_tag_budget;

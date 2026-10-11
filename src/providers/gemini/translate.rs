@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn test_openai_tool_call_message_translated_to_function_call_part() {
         let req = ChatRequest {
-            model: "gemini-2.0-flash".into(),
+            model: "gemini-3.8-flash".into(),
             messages: vec![
                 Message {
                     role: Role::User,
@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn test_openai_tool_result_message_translated_to_function_response_part() {
         let req = ChatRequest {
-            model: "gemini-2.0-flash".into(),
+            model: "gemini-3.8-flash".into(),
             messages: vec![
                 Message {
                     role: Role::User,
@@ -856,7 +856,7 @@ mod tests {
             model_version: None,
             prompt_feedback: None,
         };
-        let openai = gemini_to_openai(&resp, "gemini-2.0-flash", "req-1").expect("must translate");
+        let openai = gemini_to_openai(&resp, "gemini-3.8-flash", "req-1").expect("must translate");
         let tool_calls = openai
             .choices
             .first()
@@ -870,7 +870,7 @@ mod tests {
     #[test]
     fn test_openai_to_gemini_max_tokens_field() {
         let req = ChatRequest {
-            model: "gemini-2.0-flash".into(),
+            model: "gemini-3.8-flash".into(),
             messages: vec![Message {
                 role: Role::User,
                 content: Some(MessageContent::Text("Hi".into())),
@@ -982,7 +982,7 @@ mod tests {
             prompt_feedback: None,
         };
         let sse =
-            gemini_stream_chunk_to_sse(&chunk, "gemini-2.0-flash", "req-1", 12345, true, None)
+            gemini_stream_chunk_to_sse(&chunk, "gemini-3.8-flash", "req-1", 12345, true, None)
                 .expect("must produce SSE");
         let sse = sse.expect("must have chunk");
         let data = String::from_utf8_lossy(&sse.data);
@@ -1049,7 +1049,7 @@ mod tests {
             model_version: None,
             prompt_feedback: None,
         };
-        let openai = gemini_to_openai(&resp, "gemini-2.0-flash", "req-1").expect("must translate");
+        let openai = gemini_to_openai(&resp, "gemini-3.8-flash", "req-1").expect("must translate");
         assert!(openai.usage.completion_tokens_details.is_none());
     }
 
@@ -1343,8 +1343,14 @@ mod tests {
         );
 
         // --- The persisted row, every column ---
-        let record =
-            SpendRecord::build(&RequestIdentity::default(), MODEL, "google", &finalized, 7);
+        let record = SpendRecord::build(
+            crate::domain::request_id::RequestId::mint(),
+            &RequestIdentity::default(),
+            MODEL,
+            "google",
+            &finalized,
+            7,
+        );
         assert_eq!(record.org_id, "default");
         assert_eq!(record.identity_id, "default");
         assert_eq!(record.tags, serde_json::json!({}));
@@ -1512,9 +1518,9 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_config_not_injected_for_gemini_20() {
+    fn test_thinking_config_not_injected_for_model_without_thinking_flags() {
         let req = ChatRequest {
-            model: "gemini-2.0-flash".into(),
+            model: "custom-tuned-gemini-v1".into(),
             messages: vec![Message {
                 role: Role::User,
                 content: Some(MessageContent::Text("Hi".into())),
@@ -1537,7 +1543,7 @@ mod tests {
             .and_then(|g| g.thinking_config.as_ref());
         assert!(
             thinking_config.is_none(),
-            "gemini-2.0 must not get ThinkingConfig"
+            "a model without thinking flags must not get ThinkingConfig"
         );
     }
 
@@ -1568,7 +1574,7 @@ mod tests {
     #[test]
     fn test_openai_system_message_becomes_system_instruction() {
         let req = ChatRequest {
-            model: "gemini-2.0-flash".into(),
+            model: "gemini-3.8-flash".into(),
             messages: vec![Message {
                 role: Role::System,
                 content: Some(MessageContent::Text("You are helpful.".into())),
@@ -1618,7 +1624,7 @@ mod tests {
             model_version: None,
             prompt_feedback: None,
         };
-        let openai = gemini_to_openai(&resp, "gemini-2.0-flash", "req-1").expect("must translate");
+        let openai = gemini_to_openai(&resp, "gemini-3.8-flash", "req-1").expect("must translate");
         assert_eq!(openai.choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
@@ -1639,7 +1645,7 @@ mod tests {
             model_version: None,
             prompt_feedback: None,
         };
-        let openai = gemini_to_openai(&resp, "gemini-2.0-flash", "req-1").expect("must translate");
+        let openai = gemini_to_openai(&resp, "gemini-3.8-flash", "req-1").expect("must translate");
         assert_eq!(
             openai.choices[0].finish_reason.as_deref(),
             Some("content_filter")
@@ -1720,7 +1726,7 @@ mod tests {
             model_version: None,
             prompt_feedback: None,
         };
-        let openai = gemini_to_openai(&resp, "gemini-2.0-flash", "req-1").expect("must translate");
+        let openai = gemini_to_openai(&resp, "gemini-3.8-flash", "req-1").expect("must translate");
         assert_eq!(openai.usage.prompt_tokens, 0);
         assert_eq!(openai.usage.completion_tokens, 0);
         assert_eq!(openai.usage.total_tokens, 0);
@@ -1732,7 +1738,7 @@ mod tests {
     fn test_tool_message_without_tool_call_id_returns_err() {
         // A Role::Tool message with no tool_call_id is a malformed client request.
         let req = crate::domain::chat::ChatRequest {
-            model: "gemini-2.0-flash".into(),
+            model: "gemini-3.8-flash".into(),
             messages: vec![
                 crate::domain::chat::Message {
                     role: crate::domain::chat::Role::User,
@@ -1773,7 +1779,7 @@ mod tests {
         // tool_call_id present but no matching assistant tool_call in this request.
         use crate::domain::chat::*;
         let req = ChatRequest {
-            model: "gemini-2.0-flash".into(),
+            model: "gemini-3.8-flash".into(),
             messages: vec![
                 Message {
                     role: Role::User,
@@ -1821,7 +1827,7 @@ mod tests {
 
         let oversized = "z".repeat(TOOL_ARGS_MAX_BYTES + 1);
         let req = crate::domain::chat::ChatRequest {
-            model: "gemini-2.0-flash".into(),
+            model: "gemini-3.8-flash".into(),
             messages: vec![
                 Message {
                     role: Role::User,

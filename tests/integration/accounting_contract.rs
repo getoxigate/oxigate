@@ -30,8 +30,9 @@
 //!   the input and output token headers.
 //!
 //! Rows are data; [`run_row`] is the only place that asserts on them. They run in sequence on one
-//! Postgres/Redis pair, because `spend_records` carries no request identifier: a row is told
-//! apart from the one before it by clearing the table and the counter first.
+//! Postgres/Redis pair, because the budget counter carries no request identifier and a row is read
+//! without joining on one: a row is told apart from the one before it by clearing the table and
+//! the counter first.
 //!
 //! A contract's buffered and streamed rows are held to one shared [`Accounting`] value, so the
 //! pair is the buffered-versus-streamed parity check: both must produce the same cost, status and

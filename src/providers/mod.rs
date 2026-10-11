@@ -18,6 +18,8 @@ use crate::redis_pool::RedisPool;
 pub mod anthropic;
 pub mod azure;
 pub mod bedrock;
+#[cfg(test)]
+mod default_models;
 pub mod gemini;
 pub mod health;
 pub mod openai;

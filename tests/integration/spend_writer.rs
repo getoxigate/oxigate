@@ -19,6 +19,7 @@ use oxigate::api::CHAT_COMPLETIONS_PATH;
 use oxigate::config::BudgetDuration;
 use oxigate::domain::chat::{StreamChunk, Usage};
 use oxigate::domain::ports::NanoUsd;
+use oxigate::domain::request_id::RequestId;
 use oxigate::domain::spend::SpendRecord;
 use oxigate::domain::usage_accounting::{
     CacheWriteClass, CacheWriteEvidence, CostStatus, EVIDENCE_SCHEMA_VERSION, EvidenceEntry,
@@ -31,6 +32,7 @@ use chrono_tz::UTC;
 /// Build a SpendRecord directly (SpendRecord has no #[non_exhaustive], all fields public).
 fn make_record(org: &str, id: &str, cost: i64) -> SpendRecord {
     SpendRecord {
+        request_id: RequestId::mint(),
         org_id: org.into(),
         identity_id: id.into(),
         model: "gpt-4.1".into(),
@@ -63,6 +65,7 @@ async fn test_write_spend_inserts_row() {
 
     // Use a record with non-zero values for every schema column under test.
     let record = SpendRecord {
+        request_id: RequestId::mint(),
         org_id: "acme".into(),
         identity_id: "key-1".into(),
         model: "gpt-4.1".into(),
@@ -136,6 +139,46 @@ async fn test_write_spend_inserts_row() {
     );
 }
 
+/// The row is stored under the record's request ID, and a second write under the same ID
+/// neither overwrites nor duplicates it: the primary key rejects the second INSERT, which the
+/// writer logs and swallows rather than panicking. Only the persisted row is asserted; what the
+/// Redis counters do on a duplicate is outside this contract.
+#[tokio::test]
+async fn test_write_spend_duplicate_request_id_keeps_first_row() {
+    let pg = PgContainer::start().await.expect("pg container");
+    let redis = RedisContainer::start().await.expect("redis container");
+    let pool = Arc::new(RwLock::new(pg.pool.clone()));
+    let rp = Arc::new(RwLock::new(redis.pool.clone()));
+
+    let first = make_record("acme", "key-first", 1_000);
+    let mut second = make_record("acme", "key-second", 2_000);
+    second.request_id = first.request_id;
+    let id = first.request_id.as_uuid();
+
+    for record in [first, second] {
+        oxigate::db::spend_writer::write_spend(
+            record,
+            Arc::clone(&pool),
+            Arc::clone(&rp),
+            BudgetDuration::None,
+            UTC,
+            Utc::now(),
+        )
+        .await;
+    }
+
+    let rows: Vec<(uuid::Uuid, String, i64)> =
+        sqlx::query_as("SELECT id, identity_id, cost_nano_usd FROM spend_records")
+            .fetch_all(&pg.pool)
+            .await
+            .expect("spend_records is queryable");
+    assert_eq!(
+        rows,
+        vec![(id, "key-first".to_string(), 1_000)],
+        "exactly one row, stored under the request ID, holding the first record's values"
+    );
+}
+
 /// AC26: a positive cache-write row's `usage_evidence` round-trips through Postgres JSONB as the
 /// exact typed document that was written — every field, not only a summary of it — and a
 /// non-default `cost_status` survives alongside it unchanged.
@@ -182,6 +225,7 @@ async fn test_write_spend_positive_cache_write_evidence_round_trips_through_json
     };
 
     let record = SpendRecord {
+        request_id: RequestId::mint(),
         org_id: "acme".into(),
         identity_id: "key-evidence".into(),
         model: "claude-sonnet-4-6".into(),

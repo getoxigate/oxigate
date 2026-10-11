@@ -215,6 +215,32 @@ scope a request is billed to.
 
 ---
 
+## Request ID
+
+OxiGate mints one ID for every request it accepts on a `/v1` route and returns it in a response
+header:
+
+| Header | Example | Description |
+|---|---|---|
+| `X-Oxigate-Request-Id` | `01920f3c-5b7e-7a41-9c1d-3e8f2a6b4d10` | The gateway's identifier for this request. |
+
+- **Value.** An opaque UUID string. Each request gets a different one. Do not depend on its
+  version, its ordering, or anything else about its shape — only on its uniqueness.
+- **Where it appears.** On every response from `/v1/chat/completions`, `/v1/embeddings`,
+  `/v1/models` and `/v1/spend/*`, errors included: buffered and streamed responses, provider
+  errors, and gateway rejections such as 401, 413 and 429. On a streamed response it arrives with
+  the response headers, before the first event. It does not appear on `/health*` or `/metrics`,
+  nor on the 404 returned for a path the gateway does not serve.
+- **Link to spend.** A request produces at most one `spend_records` row, and that row's `id`
+  equals the header value. A request that writes no row (a rejection, a provider error, an
+  embedding response without usage) still gets an ID.
+- **Chat completion IDs.** On the Anthropic, Bedrock and Gemini lanes the response `id` is
+  `chatcmpl-<request ID>`, on buffered responses and on every streamed chunk.
+- **Not client-settable.** An `X-Oxigate-Request-Id` header sent by the client is ignored; the
+  response always carries the ID the gateway minted.
+
+---
+
 ## Fallback + retry headers
 
 When `security.expose_provider_names: true` is set in the gateway config, two optional

@@ -27,6 +27,7 @@ mod prometheus_metrics;
 mod proptest_invariants;
 mod providers;
 mod redis_pool;
+mod request_id;
 mod request_size_limits;
 mod routing;
 mod spend_e2e;

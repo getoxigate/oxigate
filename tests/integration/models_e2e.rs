@@ -226,7 +226,7 @@ async fn test_get_models_health_status_unknown_when_absent_from_map() {
         .expect("redis container must start");
 
     // health_map is empty (default spawn) — all models must report "unknown".
-    let provider = Arc::new(ModelsTestAdapter::new("gemini", vec!["gemini-2.0-flash"]));
+    let provider = Arc::new(ModelsTestAdapter::new("gemini", vec!["gemini-3.8-flash"]));
     let gateway = TestGateway::spawn(pg.pool.clone(), redis.pool.clone(), provider).await;
 
     let response = gateway.server.get("/v1/models").await;
@@ -236,8 +236,8 @@ async fn test_get_models_health_status_unknown_when_absent_from_map() {
     let data = body["data"].as_array().expect("data must be array");
     let entry = data
         .iter()
-        .find(|e| e["id"] == "gemini-2.0-flash")
-        .expect("gemini-2.0-flash must appear in response");
+        .find(|e| e["id"] == "gemini-3.8-flash")
+        .expect("gemini-3.8-flash must appear in response");
     assert_eq!(
         entry["oxigate"]["health_status"], "unknown",
         "model must report unknown when provider is absent from health_map"

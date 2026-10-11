@@ -1157,8 +1157,8 @@ mod tests {
     /// Thinking tokens are part of Anthropic's billed output total, so charging that total whole
     /// beside them billed the thinking subset twice.
     ///
-    /// `claude-sonnet-5`, output 2,000 of which 1,500 thinking, output rate $15/Mtok.
-    /// Previously 52_500_000 nano-USD; 1.75x the 30_000_000 owed. Every component is asserted,
+    /// `claude-sonnet-5`, output 2,000 of which 1,500 thinking, output rate $10/Mtok.
+    /// Previously 35_000_000 nano-USD; 1.75x the 20_000_000 owed. Every component is asserted,
     /// not only the total, so a compensating pair of errors cannot pass.
     #[test]
     fn test_thinking_double_charge_regression() {
@@ -1189,12 +1189,12 @@ mod tests {
             token_usage.output_tokens, 2_000,
             "the reported completion total is unchanged; only what is priced at the output rate moves"
         );
-        assert_eq!(cost.output_cost, crate::domain::ports::NanoUsd(7_500_000));
+        assert_eq!(cost.output_cost, crate::domain::ports::NanoUsd(5_000_000));
         assert_eq!(
             cost.thinking_cost,
-            crate::domain::ports::NanoUsd(22_500_000)
+            crate::domain::ports::NanoUsd(15_000_000)
         );
-        assert_eq!(cost.total_cost, crate::domain::ports::NanoUsd(30_000_000));
+        assert_eq!(cost.total_cost, crate::domain::ports::NanoUsd(20_000_000));
     }
 
     /// Both `Usage` construction paths — the non-stream parse and the stream accumulator —
@@ -2987,6 +2987,7 @@ mod tests {
 
         // --- The persisted row, every column, and the bounded evidence document verbatim ---
         let record = SpendRecord::build(
+            crate::domain::request_id::RequestId::mint(),
             &RequestIdentity::default(),
             SYNTHETIC_MODEL,
             "anthropic",

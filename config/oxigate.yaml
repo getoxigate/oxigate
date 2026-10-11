@@ -47,7 +47,7 @@ log_level: "info"            # Class A — hot-reloadable. Values: trace|debug|i
 #   gemini:
 #     mode: api                    # "api" = Gemini Developer API, "vertex" = Vertex AI. Class B reload.
 #     api_key: "your-gemini-key"   # Required when mode=api. Class A hot-reload.
-#     default_model: "gemini-2.5-flash"
+#     default_model: "gemini-3.8-flash"
 #     timeout_secs: 120
 #   # Vertex AI example:
 #   gemini:
@@ -80,7 +80,7 @@ log_level: "info"            # Class A — hot-reloadable. Values: trace|debug|i
 
 # LiteLLM proxy — point the OpenAI adapter at a running LiteLLM instance to access any
 # LiteLLM-supported provider without additional Rust code (see docs/smoke-tests.md §16).
-# Run: litellm --model groq/llama-3.1-8b-instant --port 4000
+# Run: litellm --model groq/openai/gpt-oss-20b --port 4000
 # providers:
 #   openai:
 #     api_key: "any-string"           # LiteLLM proxy does not validate the key

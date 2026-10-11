@@ -1,14 +1,122 @@
 {
   "schema_version": 1,
-  "snapshot_date": "2026-08-07",
+  "snapshot_date": "2026-10-10",
   "_provenance": {
     "policy": "Snapshots record list price only — never promotional, introductory, or time-limited pricing. A model on a temporary discount or an upcoming price increase is still recorded at its current post-introductory list price. Where an entry deviates from its source for this reason, the deviation is stated in that entry's 'note'.",
     "attribution": "Entries are imported from a third-party, MIT-licensed, community-maintained model-pricing dataset. Portions Copyright (c) 2023 Berri AI; used under the MIT License. MIT requires the permission notice and warranty disclaimer to travel with the copyright line, so the full licence text is reproduced in THIRD-PARTY-NOTICES.md at the crate root — that file must accompany any redistribution of this data or of a binary built with it.",
-    "revision": "Entries carrying verified_on 2026-08-07, 2026-09-01 or 2026-09-03 were imported from that dataset at commit b45b4b73004261b47369d7d12c97d58b137a732e, so this refresh can be re-run and diffed against the same input. The 2026-09-01 and 2026-09-03 entries were re-derived at that same pinned commit rather than at the newest one: they were re-imported to correct cache multipliers, and re-deriving them at a later revision would have folded an unrelated price refresh into that correction. Older entries predate revision pinning; their exact source commit was not recorded and cannot be recovered from this file alone.",
+    "revision": "Entries carrying verified_on 2026-10-09 or 2026-10-10 were imported from that dataset at commit 4df5006f2955afc2c9a9eed58edafd59ca26f5d8, so this refresh can be re-run and diffed against the same input.",
     "field_policy": "Every field — per-token pricing, context_window, max_output_tokens, and all multipliers — is carried from the source at the pinned revision. No field is inferred from a prior-generation sibling model, and a model absent from the source is not added from memory. Cache and batch multipliers are derived as ratios of the source's absolute costs; an omitted multiplier is billed at 1.0 by the cost engine, so a multiplier the source provides is always recorded.",
     "per_entry_fields": "Entries carry optional 'source' (where the figure was actually read: 'aggregated-dataset' for a direct import, a vendor host only where that page was itself fetched), 'verified_on' (ISO date the figure was taken from that source), 'note' (caveats a future reader would otherwise misread as an import error), and 'deprecation_notice' (vendor shutdown date and migration target). A 'source' with no 'verified_on' is a pre-pinning import: the origin is known, the date is not. Earlier revisions of this file spelled some of these with a leading underscore ('_source'); that spelling is retired — the leading underscore now marks file-level metadata only, so '_provenance' is the sole underscored key in the file."
   },
   "models": {
+
+    "claude-opus-5-5": {
+      "provider": "anthropic",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier 0.05 is the vendor's published cache-hit rate for this model (5% of base input), not an import error; most models use 0.1",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 4e-06,
+          "output_per_token": 2e-05,
+          "cache_read_multiplier": 0.05,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "claude-sonnet-5-5": {
+      "provider": "anthropic",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier 0.05 is the vendor's published cache-hit rate for this model (5% of base input), not an import error; most models use 0.1",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 2e-06,
+          "output_per_token": 1e-05,
+          "cache_read_multiplier": 0.05,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "claude-haiku-5-5": {
+      "provider": "anthropic",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "second tier applies to prompts above 100,000 input tokens (base tier covers 0-100,000 inclusive)",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-07,
+          "output_per_token": 5e-07,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        },
+        {
+          "threshold": 100001,
+          "input_per_token": 5e-07,
+          "output_per_token": 2.5e-06,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "claude-fable-5-1": {
+      "provider": "anthropic",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier 0.025 is the vendor's published cache-hit rate for this model (2.5% of base input), not an import error; most models use 0.1",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-05,
+          "output_per_token": 5e-05,
+          "cache_read_multiplier": 0.025,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
 
     "claude-opus-5": {
       "provider": "anthropic",
@@ -16,7 +124,7 @@
       "max_output_tokens": 128000,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-08-07",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
@@ -26,7 +134,9 @@
           "cache_write_multipliers": {
             "5m": 1.25,
             "1h": 2.0
-          }
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
@@ -37,18 +147,20 @@
       "max_output_tokens": 128000,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-08-07",
-      "note": "post-introductory list price ($3/$15), per the list-price policy above. The source dataset carries the $2/$10 introductory rate, which expires 2026-08-31 — this deviation from the source is deliberate, do not 'correct' it back down",
+      "verified_on": "2026-10-09",
+      "note": "list price, matching the source. The vendor made the $2/$10 launch rate its standard price and cancelled the previously announced increase to $3/$15, so this entry no longer deviates from the source",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 3e-06,
-          "output_per_token": 1.5e-05,
+          "input_per_token": 2e-06,
+          "output_per_token": 1e-05,
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "5m": 1.25,
             "1h": 2.0
-          }
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
@@ -59,7 +171,7 @@
       "max_output_tokens": 128000,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-08-07",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
@@ -69,7 +181,56 @@
           "cache_write_multipliers": {
             "5m": 1.25,
             "1h": 2.0
-          }
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "claude-mythos-5-1": {
+      "provider": "anthropic",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier 0.025 is the vendor's published cache-hit rate for this model (2.5% of base input), not an import error; most models use 0.1",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-05,
+          "output_per_token": 5e-05,
+          "cache_read_multiplier": 0.025,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "claude-mythos-5": {
+      "provider": "anthropic",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-05,
+          "output_per_token": 5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
@@ -79,11 +240,13 @@
       "context_window": 128000,
       "max_output_tokens": 16384,
       "aliases": ["gpt-4o"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000025,
-          "output_per_token": 0.00001,
+          "input_per_token": 2.5e-06,
+          "output_per_token": 1e-05,
           "cache_read_multiplier": 0.5,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
@@ -96,11 +259,13 @@
       "context_window": 128000,
       "max_output_tokens": 16384,
       "aliases": ["gpt-4o-mini"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000000165,
-          "output_per_token": 0.00000066,
+          "input_per_token": 1.5e-07,
+          "output_per_token": 6e-07,
           "cache_read_multiplier": 0.5,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
@@ -110,15 +275,17 @@
 
     "gpt-4.1-2025-04-14": {
       "provider": "openai",
-      "context_window": 1000000,
+      "context_window": 1047576,
       "max_output_tokens": 32768,
       "aliases": ["gpt-4.1"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000002,
-          "output_per_token": 0.000008,
-          "cache_read_multiplier": 0.5,
+          "input_per_token": 2e-06,
+          "output_per_token": 8e-06,
+          "cache_read_multiplier": 0.25,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
         }
@@ -127,15 +294,17 @@
 
     "gpt-4.1-mini-2025-04-14": {
       "provider": "openai",
-      "context_window": 1000000,
+      "context_window": 1047576,
       "max_output_tokens": 32768,
       "aliases": ["gpt-4.1-mini"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000004,
-          "output_per_token": 0.0000016,
-          "cache_read_multiplier": 0.5,
+          "input_per_token": 4e-07,
+          "output_per_token": 1.6e-06,
+          "cache_read_multiplier": 0.25,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
         }
@@ -147,12 +316,15 @@
       "context_window": 272000,
       "max_output_tokens": 128000,
       "aliases": ["gpt-5"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down 2026-12-11. Migrate to gpt-5.6-sol.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000001375,
-          "output_per_token": 0.000011,
-          "cache_read_multiplier": 0.5,
+          "input_per_token": 1.25e-06,
+          "output_per_token": 1e-05,
+          "cache_read_multiplier": 0.1,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
         }
@@ -164,12 +336,15 @@
       "context_window": 272000,
       "max_output_tokens": 128000,
       "aliases": ["gpt-5-mini"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down 2026-12-11. Migrate to gpt-5.6-terra.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000000275,
-          "output_per_token": 0.0000022,
-          "cache_read_multiplier": 0.5,
+          "input_per_token": 2.5e-07,
+          "output_per_token": 2e-06,
+          "cache_read_multiplier": 0.1,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
         }
@@ -181,12 +356,15 @@
       "context_window": 272000,
       "max_output_tokens": 128000,
       "aliases": ["gpt-5-nano"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down 2026-12-11. Migrate to gpt-5.6-luna.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000000055,
-          "output_per_token": 0.00000044,
-          "cache_read_multiplier": 0.5,
+          "input_per_token": 5e-08,
+          "output_per_token": 4e-07,
+          "cache_read_multiplier": 0.1,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
         }
@@ -198,12 +376,151 @@
       "context_window": 272000,
       "max_output_tokens": 128000,
       "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down 2027-04-01. Migrate to gpt-6-sol.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000125,
-          "output_per_token": 0.00001,
-          "cache_read_multiplier": 0.5,
+          "input_per_token": 1.25e-06,
+          "output_per_token": 1e-05,
+          "cache_read_multiplier": 0.1,
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "gpt-6-astra": {
+      "provider": "openai",
+      "context_window": 922000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "second tier applies to input tokens above 272,000 (base tier covers 0-272,000 inclusive)",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-05,
+          "output_per_token": 5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "30m": 1.25
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        },
+        {
+          "threshold": 272001,
+          "input_per_token": 2e-05,
+          "output_per_token": 7.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "30m": 1.25
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "gpt-6.1-sol": {
+      "provider": "openai",
+      "context_window": 922000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier 0.05 is the vendor's published cached-input rate for this model ($0.10 against $2 input), not an import error. Second tier applies to input tokens above 272,000 (base tier covers 0-272,000 inclusive)",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 2e-06,
+          "output_per_token": 1e-05,
+          "cache_read_multiplier": 0.05,
+          "cache_write_multipliers": {
+            "30m": 1.25
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        },
+        {
+          "threshold": 272001,
+          "input_per_token": 4e-06,
+          "output_per_token": 1.5e-05,
+          "cache_read_multiplier": 0.05,
+          "cache_write_multipliers": {
+            "30m": 1.25
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "gpt-6-sol": {
+      "provider": "openai",
+      "context_window": 922000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "second tier applies to input tokens above 272,000 (base tier covers 0-272,000 inclusive)",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 2e-06,
+          "output_per_token": 1e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "30m": 1.25
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        },
+        {
+          "threshold": 272001,
+          "input_per_token": 4e-06,
+          "output_per_token": 1.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "30m": 1.25
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "gpt-6-luna": {
+      "provider": "openai",
+      "context_window": 922000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "second tier applies to input tokens above 272,000 (base tier covers 0-272,000 inclusive)",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-07,
+          "output_per_token": 5e-07,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "30m": 1.25
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        },
+        {
+          "threshold": 272001,
+          "input_per_token": 2e-07,
+          "output_per_token": 7.5e-07,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "30m": 1.25
+          },
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
         }
@@ -212,12 +529,12 @@
 
     "gpt-5.6-sol": {
       "provider": "openai",
-      "context_window": 1050000,
+      "context_window": 922000,
       "max_output_tokens": 128000,
-      "aliases": [],
+      "aliases": ["gpt-5.6"],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-01",
-      "note": "second tier applies to input tokens above 272,000 (base tier covers 0-272,000 inclusive)",
+      "verified_on": "2026-10-09",
+      "note": "list price ($5/$30 per million tokens; $10/$45 above 272,000 input tokens), per the list-price policy above. The source carries the vendor's promotional rate ($4/$20; $8/$30), which the vendor states is available at least through 2026-11-21 \u2014 this deviation from the source is deliberate, do not 'correct' it back down. Second tier applies to input tokens above 272,000 (base tier covers 0-272,000 inclusive)",
       "tiers": [
         {
           "threshold": 0,
@@ -237,18 +554,20 @@
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "30m": 1.25
-          }
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
 
     "gpt-5.6-terra": {
       "provider": "openai",
-      "context_window": 1050000,
+      "context_window": 922000,
       "max_output_tokens": 128000,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-01",
+      "verified_on": "2026-10-09",
       "note": "second tier applies to input tokens above 272,000 (base tier covers 0-272,000 inclusive)",
       "tiers": [
         {
@@ -269,18 +588,20 @@
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "30m": 1.25
-          }
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
 
     "gpt-5.6-luna": {
       "provider": "openai",
-      "context_window": 1050000,
+      "context_window": 922000,
       "max_output_tokens": 128000,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-01",
+      "verified_on": "2026-10-09",
       "note": "second tier applies to input tokens above 272,000 (base tier covers 0-272,000 inclusive)",
       "tiers": [
         {
@@ -301,7 +622,9 @@
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "30m": 1.25
-          }
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
@@ -311,12 +634,93 @@
       "context_window": 200000,
       "max_output_tokens": 100000,
       "aliases": ["o1"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down 2026-10-23. Migrate to gpt-5.6-sol.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000165,
-          "output_per_token": 0.000066,
+          "input_per_token": 1.5e-05,
+          "output_per_token": 6e-05,
           "cache_read_multiplier": 0.5,
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "o1-pro-2025-03-19": {
+      "provider": "openai",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "aliases": ["o1-pro"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "deprecation_notice": "Shutting down 2026-10-23. Migrate to gpt-5.6-sol.",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 0.00015,
+          "output_per_token": 0.0006,
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "o3-2025-04-16": {
+      "provider": "openai",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "aliases": ["o3"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "deprecation_notice": "Shutting down 2026-12-11. Migrate to gpt-5.6-sol.",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 2e-06,
+          "output_per_token": 8e-06,
+          "cache_read_multiplier": 0.25,
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "o3-pro-2025-06-10": {
+      "provider": "openai",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "aliases": ["o3-pro"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "deprecation_notice": "Shutting down 2026-12-11. Migrate to gpt-5.6-sol.",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 2e-05,
+          "output_per_token": 8e-05,
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "o4-mini-2025-04-16": {
+      "provider": "openai",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "aliases": ["o4-mini"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "deprecation_notice": "Shutting down 2026-10-23. Migrate to gpt-5.6-terra.",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1.1e-06,
+          "output_per_token": 4.4e-06,
+          "cache_read_multiplier": 0.25,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
         }
@@ -328,28 +732,14 @@
       "context_window": 200000,
       "max_output_tokens": 100000,
       "aliases": ["o3-mini"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down 2026-10-23. Migrate to gpt-5.6-sol.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000121,
-          "output_per_token": 0.00000484,
-          "cache_read_multiplier": 0.5,
-          "batch_input_multiplier": 0.5,
-          "batch_output_multiplier": 0.5
-        }
-      ]
-    },
-
-    "gpt-5-chat": {
-      "provider": "openai",
-      "context_window": 272000,
-      "max_output_tokens": 128000,
-      "aliases": ["gpt-5-chat-latest"],
-      "tiers": [
-        {
-          "threshold": 0,
-          "input_per_token": 0.00000125,
-          "output_per_token": 0.00001,
+          "input_per_token": 1.1e-06,
+          "output_per_token": 4.4e-06,
           "cache_read_multiplier": 0.5,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
@@ -359,15 +749,18 @@
 
     "gpt-4.1-nano-2025-04-14": {
       "provider": "openai",
-      "context_window": 1000000,
+      "context_window": 1047576,
       "max_output_tokens": 32768,
       "aliases": ["gpt-4.1-nano"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down 2026-10-23. Migrate to gpt-5.6-luna.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000004,
-          "output_per_token": 0.00000016,
-          "cache_read_multiplier": 0.5,
+          "input_per_token": 1e-07,
+          "output_per_token": 4e-07,
+          "cache_read_multiplier": 0.25,
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
         }
@@ -376,92 +769,125 @@
 
     "text-embedding-3-small": {
       "provider": "openai",
-      "context_window": 8192,
+      "context_window": 8191,
       "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000002,
-          "output_per_token": 0
+          "input_per_token": 2e-08,
+          "output_per_token": 0.0,
+          "batch_input_multiplier": 0.5
         }
       ]
     },
 
     "text-embedding-3-large": {
       "provider": "openai",
-      "context_window": 8192,
+      "context_window": 8191,
       "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000013,
-          "output_per_token": 0
+          "input_per_token": 1.3e-07,
+          "output_per_token": 0.0,
+          "batch_input_multiplier": 0.5
         }
       ]
     },
 
     "text-embedding-ada-002": {
       "provider": "openai",
+      "context_window": 8191,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-07,
+          "output_per_token": 0.0
+        }
+      ]
+    },
+
+    "gemini-embedding-2": {
+      "provider": "gemini",
       "context_window": 8192,
       "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000001,
-          "output_per_token": 0
+          "input_per_token": 2e-07,
+          "output_per_token": 0.0,
+          "batch_input_multiplier": 0.5
         }
       ]
     },
 
-    "text-embedding-004": {
-      "provider": "google",
-      "context_window": 2048,
+    "claude-opus-4-8": {
+      "provider": "anthropic",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
       "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000001,
-          "output_per_token": 0
+          "input_per_token": 5e-06,
+          "output_per_token": 2.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
 
-    "gemini-embedding-exp-03-07": {
-      "provider": "google",
-      "context_window": 8192,
+    "claude-opus-4-7": {
+      "provider": "anthropic",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
       "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000001,
-          "output_per_token": 0
-        }
-      ]
-    },
-
-    "text-multilingual-embedding-002": {
-      "provider": "google",
-      "context_window": 2048,
-      "aliases": [],
-      "tiers": [
-        {
-          "threshold": 0,
-          "input_per_token": 0.0000001,
-          "output_per_token": 0
+          "input_per_token": 5e-06,
+          "output_per_token": 2.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
 
     "claude-opus-4-6": {
       "provider": "anthropic",
-      "context_window": 200000,
+      "context_window": 1000000,
       "max_output_tokens": 128000,
       "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000005,
-          "output_per_token": 0.000025,
+          "input_per_token": 5e-06,
+          "output_per_token": 2.5e-05,
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "5m": 1.25,
@@ -475,14 +901,16 @@
 
     "claude-sonnet-4-6": {
       "provider": "anthropic",
-      "context_window": 200000,
-      "max_output_tokens": 64000,
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
       "aliases": ["claude-sonnet-4"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000003,
-          "output_per_token": 0.000015,
+          "input_per_token": 3e-06,
+          "output_per_token": 1.5e-05,
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "5m": 1.25,
@@ -499,11 +927,13 @@
       "context_window": 200000,
       "max_output_tokens": 64000,
       "aliases": ["claude-haiku-4-5"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000001,
-          "output_per_token": 0.000005,
+          "input_per_token": 1e-06,
+          "output_per_token": 5e-06,
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "5m": 1.25,
@@ -521,18 +951,21 @@
       "max_output_tokens": 64000,
       "aliases": ["claude-sonnet-4-5"],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-03",
-      "note": "single flat tier. An earlier revision of this file carried a second tier at 200,001 tokens, but this model's context_window is 200,000 — that tier could never be reached by any request. Do not re-add one",
+      "verified_on": "2026-10-09",
+      "note": "context_window 200,000 and a single flat tier, deviating from the source: the source lists 1,000,000 input tokens and a second tier above 200,000, but the vendor documents a 200k context window for this model. A tier above the context window could never be reached. Do not re-add one",
+      "deprecation_notice": "Shutting down 2026-11-30. Migrate to claude-sonnet-5-5.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000003,
-          "output_per_token": 0.000015,
+          "input_per_token": 3e-06,
+          "output_per_token": 1.5e-05,
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "5m": 1.25,
             "1h": 2.0
-          }
+          },
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
@@ -542,11 +975,13 @@
       "context_window": 200000,
       "max_output_tokens": 64000,
       "aliases": ["claude-opus-4-5"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000005,
-          "output_per_token": 0.000025,
+          "input_per_token": 5e-06,
+          "output_per_token": 2.5e-05,
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "5m": 1.25,
@@ -558,16 +993,287 @@
       ]
     },
 
-    "claude-3-sonnet-20240229": {
-      "provider": "anthropic",
+    "anthropic.claude-fable-5-1": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier 0.025 is the vendor's published cache-hit rate for this model (2.5% of base input), not an import error; most models use 0.1",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-05,
+          "output_per_token": 5e-05,
+          "cache_read_multiplier": 0.025,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-mythos-5-1": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier 0.025 is the vendor's published cache-hit rate for this model (2.5% of base input), not an import error; most models use 0.1",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-05,
+          "output_per_token": 5e-05,
+          "cache_read_multiplier": 0.025,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-fable-5": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-05,
+          "output_per_token": 5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-opus-5-5": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier 0.05 is the vendor's published cache-hit rate for this model (5% of base input), not an import error; most models use 0.1",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 4e-06,
+          "output_per_token": 2e-05,
+          "cache_read_multiplier": 0.05,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-opus-5": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 5e-06,
+          "output_per_token": 2.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-sonnet-5-5": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier 0.05 is the vendor's published cache-hit rate for this model (5% of base input), not an import error; most models use 0.1",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 2e-06,
+          "output_per_token": 1e-05,
+          "cache_read_multiplier": 0.05,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-sonnet-5": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 2e-06,
+          "output_per_token": 1e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-haiku-5-5": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "second tier applies to prompts above 100,000 input tokens (base tier covers 0-100,000 inclusive)",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1e-07,
+          "output_per_token": 5e-07,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        },
+        {
+          "threshold": 100001,
+          "input_per_token": 5e-07,
+          "output_per_token": 2.5e-06,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-opus-4-8": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 5e-06,
+          "output_per_token": 2.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-opus-4-7": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 5e-06,
+          "output_per_token": 2.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-opus-4-6-v1": {
+      "provider": "bedrock_converse",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 5e-06,
+          "output_per_token": 2.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-opus-4-5-20251101-v1:0": {
+      "provider": "bedrock_converse",
       "context_window": 200000,
-      "max_output_tokens": 4096,
-      "aliases": ["claude-3-sonnet"],
+      "max_output_tokens": 64000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000003,
-          "output_per_token": 0.000015,
+          "input_per_token": 5e-06,
+          "output_per_token": 2.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25,
+            "1h": 2.0
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-sonnet-4-5-20250929-v1:0": {
+      "provider": "bedrock_converse",
+      "context_window": 200000,
+      "max_output_tokens": 64000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "context_window 200,000 and a single flat tier, deviating from the source: the source lists 200,000 input tokens yet prices a second tier above 200,000, and the vendor documents a 200k context window for this model on Bedrock. A tier above the context window could never be reached. Do not re-add one",
+      "deprecation_notice": "Shutting down on Bedrock 2027-04-08. Migrate to anthropic.claude-sonnet-5-5.",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 3e-06,
+          "output_per_token": 1.5e-05,
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "5m": 1.25,
@@ -579,16 +1285,18 @@
       ]
     },
 
-    "claude-instant-v1": {
-      "provider": "anthropic",
-      "context_window": 100000,
-      "max_output_tokens": 4096,
-      "aliases": ["claude-instant"],
+    "anthropic.claude-haiku-4-5-20251001-v1:0": {
+      "provider": "bedrock_converse",
+      "context_window": 200000,
+      "max_output_tokens": 64000,
+      "aliases": ["anthropic.claude-haiku-4-5"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000008,
-          "output_per_token": 0.0000024,
+          "input_per_token": 1e-06,
+          "output_per_token": 5e-06,
           "cache_read_multiplier": 0.1,
           "cache_write_multipliers": {
             "5m": 1.25,
@@ -596,6 +1304,49 @@
           },
           "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "anthropic.claude-opus-4-1-20250805-v1:0": {
+      "provider": "bedrock_converse",
+      "context_window": 200000,
+      "max_output_tokens": 32000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "deprecation_notice": "Shutting down on Bedrock 2027-01-08. Migrate to anthropic.claude-opus-4-8.",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1.5e-05,
+          "output_per_token": 7.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25
+          }
+        }
+      ]
+    },
+
+    "anthropic.claude-sonnet-4-20250514-v1:0": {
+      "provider": "bedrock_converse",
+      "context_window": 200000,
+      "max_output_tokens": 64000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "context_window 200,000 and a single flat tier, deviating from the source: the source lists 1,000,000 input tokens and a second tier above 200,000, but the vendor documents a 200k context window for this model on Bedrock. A tier above the context window could never be reached. Do not re-add one",
+      "deprecation_notice": "Shutting down on Bedrock 2026-10-14. Migrate to anthropic.claude-sonnet-5-5.",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 3e-06,
+          "output_per_token": 1.5e-05,
+          "cache_read_multiplier": 0.1,
+          "cache_write_multipliers": {
+            "5m": 1.25
+          }
         }
       ]
     },
@@ -606,7 +1357,7 @@
       "max_output_tokens": 64000,
       "aliases": ["us.anthropic.claude-sonnet-4-6"],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-01",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
@@ -624,21 +1375,23 @@
     "gemini-2.5-pro": {
       "provider": "gemini",
       "context_window": 1048576,
-      "max_output_tokens": 65535,
+      "max_output_tokens": 65536,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-03",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down on Vertex AI 2026-10-20. Migrate to gemini-3.8-flash.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000125,
-          "output_per_token": 0.00001,
-          "cache_read_multiplier": 0.1
+          "input_per_token": 1.25e-06,
+          "output_per_token": 1e-05,
+          "cache_read_multiplier": 0.1,
+          "batch_output_multiplier": 0.5
         },
         {
           "threshold": 200001,
-          "input_per_token": 0.0000025,
-          "output_per_token": 0.000015,
+          "input_per_token": 2.5e-06,
+          "output_per_token": 1.5e-05,
           "cache_read_multiplier": 0.1
         }
       ]
@@ -647,16 +1400,18 @@
     "gemini-2.5-flash": {
       "provider": "gemini",
       "context_window": 1048576,
-      "max_output_tokens": 65535,
+      "max_output_tokens": 65536,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-03",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down on Vertex AI 2026-10-20. Migrate to gemini-3.8-flash.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000003,
-          "output_per_token": 0.0000025,
-          "cache_read_multiplier": 0.1
+          "input_per_token": 3e-07,
+          "output_per_token": 2.5e-06,
+          "cache_read_multiplier": 0.1,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
@@ -664,54 +1419,18 @@
     "gemini-2.5-flash-lite": {
       "provider": "gemini",
       "context_window": 1048576,
-      "max_output_tokens": 65535,
+      "max_output_tokens": 65536,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-03",
+      "verified_on": "2026-10-09",
+      "deprecation_notice": "Shutting down on Vertex AI 2026-10-20. Migrate to gemini-3.1-flash-lite.",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000001,
-          "output_per_token": 0.0000004,
-          "cache_read_multiplier": 0.1
-        }
-      ]
-    },
-
-    "gemini-2.0-flash-001": {
-      "provider": "gemini",
-      "context_window": 1048576,
-      "max_output_tokens": 8192,
-      "aliases": ["gemini-2.0-flash"],
-      "source": "aggregated-dataset",
-      "verified_on": "2026-09-03",
-      "deprecation_notice": "Shutting down 2026-06-01. Migrate to gemini-2.5-flash.",
-      "tiers": [
-        {
-          "threshold": 0,
-          "input_per_token": 0.0000001,
-          "output_per_token": 0.0000004,
-          "cache_read_multiplier": 0.25
-        }
-      ]
-    },
-
-    "gemini-1.5-pro-002": {
-      "provider": "vertex",
-      "context_window": 2000000,
-      "aliases": ["gemini-1.5-pro"],
-      "tiers": [
-        {
-          "threshold": 0,
-          "input_per_token": 0.00000125,
-          "output_per_token": 0.000005,
-          "cache_read_multiplier": 0.25
-        },
-        {
-          "threshold": 128001,
-          "input_per_token": 0.0000025,
-          "output_per_token": 0.00001,
-          "cache_read_multiplier": 0.25
+          "input_per_token": 1e-07,
+          "output_per_token": 4e-07,
+          "cache_read_multiplier": 0.1,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
@@ -722,20 +1441,19 @@
       "max_output_tokens": 65536,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-03",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000002,
-          "output_per_token": 0.000012,
+          "input_per_token": 2e-06,
+          "output_per_token": 1.2e-05,
           "cache_read_multiplier": 0.1,
-          "batch_input_multiplier": 0.5,
           "batch_output_multiplier": 0.5
         },
         {
           "threshold": 200001,
-          "input_per_token": 0.000004,
-          "output_per_token": 0.000018,
+          "input_per_token": 4e-06,
+          "output_per_token": 1.8e-05,
           "cache_read_multiplier": 0.1
         }
       ]
@@ -744,33 +1462,74 @@
     "gemini-3-flash-preview": {
       "provider": "gemini",
       "context_window": 1048576,
-      "max_output_tokens": 65535,
+      "max_output_tokens": 65536,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-03",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000005,
-          "output_per_token": 0.000003,
-          "cache_read_multiplier": 0.1
+          "input_per_token": 5e-07,
+          "output_per_token": 3e-06,
+          "cache_read_multiplier": 0.1,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
 
-    "gemini-3.1-flash-lite-preview": {
+    "gemini-3.8-flash": {
       "provider": "gemini",
       "context_window": 1048576,
       "max_output_tokens": 65536,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-09-03",
+      "verified_on": "2026-10-09",
+      "note": "list price ($1.50/$7.50 per million tokens), per the list-price policy above. The source carries the vendor's current rate ($0.75/$3.75), which the vendor states applies through 2026-12-31 before rising to $1.50/$7.50 on 2027-01-01 \u2014 this deviation from the source is deliberate, do not 'correct' it back down. Cache and batch rates double on the same date, so every multiplier matches the source",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000025,
-          "output_per_token": 0.0000015,
-          "cache_read_multiplier": 0.1
+          "input_per_token": 1.5e-06,
+          "output_per_token": 7.5e-06,
+          "cache_read_multiplier": 0.1,
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "gemini-3.5-flash-lite": {
+      "provider": "gemini",
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 3e-07,
+          "output_per_token": 2.5e-06,
+          "cache_read_multiplier": 0.1,
+          "batch_output_multiplier": 0.5
+        }
+      ]
+    },
+
+    "gemini-3.1-flash-lite": {
+      "provider": "gemini",
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 2.5e-07,
+          "output_per_token": 1.5e-06,
+          "cache_read_multiplier": 0.1,
+          "batch_input_multiplier": 0.5,
+          "batch_output_multiplier": 0.5
         }
       ]
     },
@@ -778,20 +1537,17 @@
     "deepseek-v4-flash": {
       "provider": "deepseek",
       "context_window": 1000000,
-      "max_output_tokens": 8192,
+      "max_output_tokens": 393216,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-08-07",
-      "note": "vendor has signalled a near-term price increase, unscheduled — a higher figure on the next refresh is an expected vendor change, not an import bug",
+      "verified_on": "2026-10-09",
+      "note": "rates are the vendor's peak-hour list price. The vendor bills a lower off-peak rate outside its peak windows; this snapshot has no time-of-day pricing, so off-peak requests are costed at the peak rate",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 1.4e-07,
-          "output_per_token": 2.8e-07,
-          "cache_read_multiplier": 0.02,
-          "cache_write_multipliers": {
-            "5m": 0.0
-          }
+          "input_per_token": 3e-07,
+          "output_per_token": 1.2e-06,
+          "cache_read_multiplier": 0.02
         }
       ]
     },
@@ -799,20 +1555,17 @@
     "deepseek-v4-pro": {
       "provider": "deepseek",
       "context_window": 1000000,
-      "max_output_tokens": 8192,
+      "max_output_tokens": 393216,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-08-07",
-      "note": "vendor has signalled a near-term price increase, unscheduled — a higher figure on the next refresh is an expected vendor change, not an import bug. cache_read_multiplier is 1/120, an unusually deep discount; it is the real published rate, not a transcription error",
+      "verified_on": "2026-10-09",
+      "note": "rates are the vendor's peak-hour list price. The vendor bills a lower off-peak rate outside its peak windows; this snapshot has no time-of-day pricing, so off-peak requests are costed at the peak rate. cache_read_multiplier is 1/30; the full-precision value is the real published rate, not a transcription error",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 4.35e-07,
-          "output_per_token": 8.7e-07,
-          "cache_read_multiplier": 0.008333333333333333,
-          "cache_write_multipliers": {
-            "5m": 0.0
-          }
+          "input_per_token": 1.32e-06,
+          "output_per_token": 3.96e-06,
+          "cache_read_multiplier": 0.033333333333333326
         }
       ]
     },
@@ -823,16 +1576,13 @@
       "max_output_tokens": 128000,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-08-07",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
           "input_per_token": 1e-06,
           "output_per_token": 3.2e-06,
-          "cache_read_multiplier": 0.2,
-          "cache_write_multipliers": {
-            "5m": 0.0
-          }
+          "cache_read_multiplier": 0.2
         }
       ]
     },
@@ -843,17 +1593,32 @@
       "max_output_tokens": 128000,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-08-07",
+      "verified_on": "2026-10-09",
       "note": "cache_read_multiplier is 13/70 and does not reduce to a short decimal; the full-precision value is the real published rate, not a transcription error",
       "tiers": [
         {
           "threshold": 0,
           "input_per_token": 1.4e-06,
           "output_per_token": 4.4e-06,
-          "cache_read_multiplier": 0.18571428571428572,
-          "cache_write_multipliers": {
-            "5m": 0.0
-          }
+          "cache_read_multiplier": 0.18571428571428572
+        }
+      ]
+    },
+
+    "glm-5.3": {
+      "provider": "zai",
+      "context_window": 1000000,
+      "max_output_tokens": 128000,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier is 13/70 and does not reduce to a short decimal; the full-precision value is the real published rate, not a transcription error",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1.4e-06,
+          "output_per_token": 4.4e-06,
+          "cache_read_multiplier": 0.18571428571428572
         }
       ]
     },
@@ -864,8 +1629,8 @@
       "max_output_tokens": 65536,
       "aliases": [],
       "source": "aggregated-dataset",
-      "verified_on": "2026-08-07",
-      "note": "list price, matching the source at the pinned revision — this entry does not deviate from it. A promotional rate was advertised on the vendor's own page around the time of import; the source dataset carried list price regardless, so nothing had to be overridden here",
+      "verified_on": "2026-10-09",
+      "note": "list price, matching the source at the pinned revision \u2014 this entry does not deviate from it",
       "tiers": [
         {
           "threshold": 0,
@@ -876,186 +1641,243 @@
       ]
     },
 
-    "mistral-large-latest": {
-      "provider": "mistral",
-      "context_window": 262144,
-      "aliases": ["mistral-large-2411", "mistral-large-2512"],
+    "qwen3.8-max": {
+      "provider": "dashscope",
+      "context_window": 991808,
+      "max_output_tokens": 131072,
+      "aliases": [],
       "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.0000005,
-          "output_per_token": 0.0000015
+          "input_per_token": 2e-06,
+          "output_per_token": 6e-06,
+          "cache_read_multiplier": 0.125
+        }
+      ]
+    },
+
+    "qwen3.8-flash": {
+      "provider": "dashscope",
+      "context_window": 991808,
+      "max_output_tokens": 131072,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "note": "cache_read_multiplier and the 5m cache_write_multipliers entry are the source's published rates at full precision (the source prices a cache write at 4/3 of input; the vendor's context-cache page states 125%). Cache writes are not yet accounted on the OpenAI-compatible lane this model routes through: written tokens bill at the plain input rate, so the write premium over input goes uncounted",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1.5e-07,
+          "output_per_token": 4.7e-07,
+          "cache_read_multiplier": 0.10666666666666667,
+          "cache_write_multipliers": {
+            "5m": 1.3333333333333333
+          }
+        }
+      ]
+    },
+
+    "mistral-medium-3-5": {
+      "provider": "mistral",
+      "context_window": 262144,
+      "max_output_tokens": 262144,
+      "aliases": ["mistral-medium-3", "mistral-medium-latest"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1.5e-06,
+          "output_per_token": 7.5e-06,
+          "cache_read_multiplier": 0.1
+        }
+      ]
+    },
+
+    "mistral-large-latest": {
+      "provider": "mistral",
+      "context_window": 262144,
+      "max_output_tokens": 262144,
+      "aliases": ["mistral-large-2411", "mistral-large-2512"],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 5e-07,
+          "output_per_token": 1.5e-06,
+          "cache_read_multiplier": 0.1
         }
       ]
     },
 
     "mistral-small-latest": {
       "provider": "mistral",
-      "context_window": 131072,
+      "context_window": 262144,
+      "max_output_tokens": 262144,
       "aliases": ["mistral-small-3.1-24b"],
       "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000006,
-          "output_per_token": 0.00000018
+          "input_per_token": 1.5e-07,
+          "output_per_token": 6e-07,
+          "cache_read_multiplier": 0.1
         }
       ]
     },
 
     "codestral-latest": {
       "provider": "mistral",
-      "context_window": 32000,
+      "context_window": 128000,
+      "max_output_tokens": 128000,
       "aliases": ["codestral-2501"],
       "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000001,
-          "output_per_token": 0.000003
+          "input_per_token": 3e-07,
+          "output_per_token": 9e-07,
+          "cache_read_multiplier": 0.1
         }
       ]
     },
 
-    "open-mistral-7b": {
+    "ministral-8b-latest": {
       "provider": "mistral",
-      "context_window": 32000,
-      "aliases": ["mistral-7b-instruct"],
-      "source": "aggregated-dataset",
-      "tiers": [
-        {
-          "threshold": 0,
-          "input_per_token": 0.00000025,
-          "output_per_token": 0.00000025
-        }
-      ]
-    },
-
-    "open-mixtral-8x7b": {
-      "provider": "mistral",
-      "context_window": 32000,
-      "aliases": ["mixtral-8x7b-instruct"],
-      "source": "aggregated-dataset",
-      "tiers": [
-        {
-          "threshold": 0,
-          "input_per_token": 0.0000007,
-          "output_per_token": 0.0000007
-        }
-      ]
-    },
-
-    "llama-3.3-70b-versatile": {
-      "provider": "groq",
-      "context_window": 128000,
-      "aliases": ["llama3-70b-8192"],
-      "source": "aggregated-dataset",
-      "tiers": [
-        {
-          "threshold": 0,
-          "input_per_token": 0.00000059,
-          "output_per_token": 0.00000079
-        }
-      ]
-    },
-
-    "llama-3.1-8b-instant": {
-      "provider": "groq",
-      "context_window": 128000,
+      "context_window": 262144,
+      "max_output_tokens": 262144,
       "aliases": [],
       "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000005,
-          "output_per_token": 0.00000008
+          "input_per_token": 1.5e-07,
+          "output_per_token": 1.5e-07,
+          "cache_read_multiplier": 0.1
         }
       ]
     },
 
-    "meta-llama/Llama-3.3-70B-Instruct-Turbo": {
-      "provider": "together-ai",
+    "openai/gpt-oss-120b": {
+      "provider": "groq",
       "context_window": 131072,
-      "aliases": ["meta-llama/Llama-3-70b-chat-hf"],
+      "max_output_tokens": 65536,
+      "aliases": [],
       "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000088,
-          "output_per_token": 0.00000088
+          "input_per_token": 1.5e-07,
+          "output_per_token": 6e-07,
+          "cache_read_multiplier": 0.5
         }
       ]
     },
 
-    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo": {
-      "provider": "together-ai",
+    "openai/gpt-oss-20b": {
+      "provider": "groq",
+      "context_window": 131072,
+      "max_output_tokens": 65536,
+      "aliases": [],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 7.5e-08,
+          "output_per_token": 3e-07,
+          "cache_read_multiplier": 0.5
+        }
+      ]
+    },
+
+    "meta-models/Muse-Glimmer-30B": {
+      "provider": "together_ai",
       "context_window": 131072,
       "aliases": [],
       "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000018,
-          "output_per_token": 0.00000018
+          "input_per_token": 3.5e-07,
+          "output_per_token": 1.5e-06,
+          "cache_read_multiplier": 0.1142857142857143
         }
       ]
     },
 
-    "grok-3-latest": {
+    "grok-4.7": {
       "provider": "xai",
-      "context_window": 131072,
-      "aliases": ["grok-3", "grok-3-beta"],
+      "context_window": 500000,
+      "max_output_tokens": 500000,
+      "aliases": [],
       "source": "aggregated-dataset",
+      "verified_on": "2026-10-10",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.000003,
-          "output_per_token": 0.000015,
+          "input_per_token": 2e-06,
+          "output_per_token": 6e-06,
+          "cache_read_multiplier": 0.25
+        },
+        {
+          "threshold": 200001,
+          "input_per_token": 4e-06,
+          "output_per_token": 1.2e-05,
           "cache_read_multiplier": 0.25
         }
       ]
     },
 
-    "grok-3-mini-latest": {
+    "grok-4.3": {
       "provider": "xai",
+      "context_window": 1000000,
+      "max_output_tokens": 1000000,
+      "aliases": [
+        "grok-4.3-latest"
+      ],
+      "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
+      "tiers": [
+        {
+          "threshold": 0,
+          "input_per_token": 1.25e-06,
+          "output_per_token": 2.5e-06,
+          "cache_read_multiplier": 0.16,
+          "batch_input_multiplier": 0.8,
+          "batch_output_multiplier": 0.8
+        },
+        {
+          "threshold": 200001,
+          "input_per_token": 2.5e-06,
+          "output_per_token": 5e-06,
+          "cache_read_multiplier": 0.16,
+          "batch_input_multiplier": 0.8,
+          "batch_output_multiplier": 0.8
+        }
+      ]
+    },
+
+    "gpt-oss-120b": {
+      "provider": "cerebras",
       "context_window": 131072,
-      "aliases": ["grok-3-mini", "grok-3-mini-beta"],
-      "source": "aggregated-dataset",
-      "tiers": [
-        {
-          "threshold": 0,
-          "input_per_token": 0.0000003,
-          "output_per_token": 0.0000005,
-          "cache_read_multiplier": 0.25
-        }
-      ]
-    },
-
-    "llama-3.3-70b": {
-      "provider": "cerebras",
-      "context_window": 128000,
+      "max_output_tokens": 32768,
       "aliases": [],
       "source": "aggregated-dataset",
+      "verified_on": "2026-10-09",
       "tiers": [
         {
           "threshold": 0,
-          "input_per_token": 0.00000085,
-          "output_per_token": 0.0000012
-        }
-      ]
-    },
-
-    "llama3.1-8b": {
-      "provider": "cerebras",
-      "context_window": 128000,
-      "aliases": [],
-      "source": "aggregated-dataset",
-      "tiers": [
-        {
-          "threshold": 0,
-          "input_per_token": 0.0000001,
-          "output_per_token": 0.0000001
+          "input_per_token": 3.5e-07,
+          "output_per_token": 7.5e-07
         }
       ]
     }

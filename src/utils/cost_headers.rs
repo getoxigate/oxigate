@@ -1652,7 +1652,14 @@ mod tests {
             label: None,
             tags: std::collections::HashMap::new(),
         };
-        let record = SpendRecord::build(&identity, "gpt-4.1", "openai", &finalized, 1);
+        let record = SpendRecord::build(
+            crate::domain::request_id::RequestId::mint(),
+            &identity,
+            "gpt-4.1",
+            "openai",
+            &finalized,
+            1,
+        );
         assert_eq!(
             record.completion_tokens, 1_000,
             "persistence sees the provider-reported completion total"
@@ -1977,7 +1984,14 @@ mod tests {
             label: None,
             tags: std::collections::HashMap::new(),
         };
-        let record = SpendRecord::build(&identity, "gpt-5.6-terra", "openai", &finalized, 1);
+        let record = SpendRecord::build(
+            crate::domain::request_id::RequestId::mint(),
+            &identity,
+            "gpt-5.6-terra",
+            "openai",
+            &finalized,
+            1,
+        );
         assert_eq!(record.prompt_tokens, 8_000, "the persisted billable input");
         assert_eq!(record.completion_tokens, 500);
         assert_eq!(record.cache_read_tokens, 2_000);

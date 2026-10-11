@@ -30,7 +30,8 @@ fn main() -> Result<()> {
 // Subcommands
 // ---------------------------------------------------------------------------
 
-/// Local pre-commit gate: provider usage scan → fmt → clippy → test. Exits on first failure.
+/// Local pre-commit gate: provider usage scan → fmt → clippy → test, then the capture harness's
+/// clippy and tests. Exits on first failure.
 fn check() -> Result<()> {
     // First: it parses source and runs no toolchain, so it costs well under a second.
     usage_scan::run()?;
@@ -50,6 +51,21 @@ fn check() -> Result<()> {
     } else {
         run("cargo", &["test", "--all-features"])?;
     }
+    // The capture harness is its own workspace member, which the root-package runs above do not
+    // reach. Separate invocations, so its dependencies' features do not unify into the library's.
+    run(
+        "cargo",
+        &[
+            "clippy",
+            "--package",
+            "spend-capture",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    run("cargo", &["test", "--package", "spend-capture"])?;
     Ok(())
 }
 
@@ -61,10 +77,11 @@ fn ci() -> Result<()> {
     Ok(())
 }
 
-/// Dependency and license audit.
+/// Dependency and license audit. `--workspace` makes cargo deny check every member, not only
+/// the root package.
 fn audit() -> Result<()> {
     run("cargo", &["audit"])?;
-    run("cargo", &["deny", "check"])?;
+    run("cargo", &["deny", "--workspace", "check"])?;
     Ok(())
 }
 

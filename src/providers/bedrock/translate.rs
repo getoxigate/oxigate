@@ -1088,6 +1088,7 @@ mod tests {
             cache_details: Some(vec![detail("5m", 1_000), detail("1h", 500)]),
         });
         let record = SpendRecord::build(
+            crate::domain::request_id::RequestId::mint(),
             &RequestIdentity::default(),
             PRICED_MODEL,
             "bedrock",
@@ -1278,6 +1279,7 @@ mod tests {
 
         // --- The persisted row, every column, and the bounded evidence document verbatim ---
         let record = SpendRecord::build(
+            crate::domain::request_id::RequestId::mint(),
             &RequestIdentity::default(),
             SYNTHETIC_MODEL,
             "bedrock",

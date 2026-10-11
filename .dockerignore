@@ -8,3 +8,4 @@ target/
 .git/
 docs/
 benches/
+spend-capture/results/

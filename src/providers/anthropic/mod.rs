@@ -52,12 +52,24 @@ const ANTHROPIC_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 /// 2026-01-05), claude-3-haiku-20240307 (retired 2026-04-20).
 const KNOWN_ANTHROPIC_MODELS: &[(&str, bool)] = &[
     // ── Current generation ──────────────────────────────────────────────────
+    ("claude-fable-5-1", true),
+    ("claude-opus-5-5", true),
+    ("claude-sonnet-5-5", true),
+    ("claude-haiku-5-5", true),
+    // ── Legacy (still available — migrate when convenient) ───────────────────
+    ("claude-fable-5", true),
+    ("claude-opus-5", true),
+    ("claude-sonnet-5", true),
+    ("claude-mythos-5-1", true),
+    ("claude-mythos-5", true),
+    ("claude-opus-4-8", true),
+    ("claude-opus-4-7", true),
     ("claude-opus-4-6", true),
     ("claude-sonnet-4-6", true),
     ("claude-haiku-4-5-20251001", true),
-    // ── Legacy (still available — migrate when convenient) ───────────────────
-    ("claude-sonnet-4-5-20250929", true),
     ("claude-opus-4-5-20251101", true),
+    // ── Deprecated (retirement date announced) ──────────────────────────────
+    ("claude-sonnet-4-5-20250929", true),
 ];
 
 fn anthropic_base_url(config: &AnthropicConfig) -> String {
@@ -244,7 +256,7 @@ impl AnthropicAdapter {
 impl ProviderAdapter for AnthropicAdapter {
     async fn chat_completion(&self, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         let model = self.model(&req.model);
-        let request_id = req.request_id.as_deref().unwrap_or("unknown");
+        let request_id = &req.request_id_or_mint(&self.metadata().name);
 
         let anthropic_req = chat_request_to_anthropic(
             req,
@@ -304,7 +316,7 @@ impl ProviderAdapter for AnthropicAdapter {
         req: &ChatRequest,
     ) -> Result<ChatCompletionStream, ProviderError> {
         let model = self.model(&req.model);
-        let request_id = req.request_id.as_deref().unwrap_or("unknown").to_string();
+        let request_id = req.request_id_or_mint(&self.metadata().name);
 
         let mut anthropic_req = chat_request_to_anthropic(
             req,

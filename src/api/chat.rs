@@ -30,6 +30,7 @@ use crate::api::AppState;
 use crate::domain::auth::RequestIdentity;
 use crate::domain::chat::ChatRequest;
 use crate::domain::ports::{AttemptedMeta, ProviderError};
+use crate::domain::request_id::RequestId;
 use crate::domain::spend::SpendRecord;
 use crate::middleware::request_metrics::ProviderLabel;
 use crate::observability::metrics::{COST_USD_TOTAL, ENDPOINT_CHAT};
@@ -73,7 +74,7 @@ struct RequestAccounting {
     /// was at that moment even if a reload swaps it mid-stream.
     budget: crate::config::BudgetConfig,
     identity: RequestIdentity,
-    request_id: String,
+    request_id: RequestId,
     provider_name: String,
     batch: bool,
     content_length: Option<u64>,
@@ -140,7 +141,7 @@ fn finalize_stream_accounting(
             0,
         ),
     };
-    cost_headers::report_finalized_warning(&acct.request_id, model_used, &accounting);
+    cost_headers::report_finalized_warning(&acct.request_id.to_string(), model_used, &accounting);
     let cost = accounting.cost.total_cost.to_display_string();
     let payload = UsageEvent {
         request_cost: &cost,
@@ -158,6 +159,7 @@ fn finalize_stream_accounting(
         -1
     });
     let record = SpendRecord::build(
+        acct.request_id,
         &acct.identity,
         model_used,
         &acct.provider_name,
@@ -181,7 +183,6 @@ fn finalize_stream_accounting(
     crate::api::spawn_cost_log_and_spend(
         "chat_completion_cost",
         record,
-        &acct.request_id,
         &cost,
         Arc::clone(&acct.pool),
         Arc::clone(&acct.redis),
@@ -640,6 +641,7 @@ mod tests {
 pub async fn chat_completions(
     State(state): State<AppState>,
     axum::Extension(identity): axum::Extension<RequestIdentity>,
+    axum::Extension(request_id): axum::Extension<RequestId>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, ChatError> {
@@ -665,12 +667,8 @@ pub async fn chat_completions(
     // Wall-clock start for latency measurement .
     let request_start = std::time::Instant::now();
 
-    let request_id = req
-        .request_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let mut req_with_id = req.clone();
-    req_with_id.request_id = Some(request_id.clone());
+    req_with_id.request_id = Some(request_id.to_string());
     // SECURITY: Do not honor user-supplied batch flag. Gateway proxies to sync endpoints,
     // not /v1/batches; honoring it would let clients artificially halve reported cost.
     // TODO: Set batch=true only when request is routed to a real batch-compatible flow.
@@ -723,7 +721,7 @@ pub async fn chat_completions(
             redis: Arc::clone(&state.redis_pool),
             budget: state.budget_settings.read().await.clone(),
             identity: identity.clone(),
-            request_id: request_id.clone(),
+            request_id,
             provider_name,
             batch,
             content_length,
@@ -908,7 +906,7 @@ pub async fn chat_completions(
         Arc::clone(&state.pricing_db),
         batch,
     );
-    cost_headers::report_finalized_warning(&request_id, &response.model, &accounting);
+    cost_headers::report_finalized_warning(&request_id.to_string(), &response.model, &accounting);
 
     let latency_ms = i32::try_from(request_start.elapsed().as_millis()).unwrap_or_else(|_| {
         tracing::warn!("request latency overflows i32; recording -1");
@@ -917,6 +915,7 @@ pub async fn chat_completions(
 
     // +: structured cost log + spawn-and-forget spend write.
     let record = SpendRecord::build(
+        request_id,
         &identity,
         &response.model,
         &provider_name,
@@ -934,7 +933,6 @@ pub async fn chat_completions(
     crate::api::spawn_cost_log_and_spend(
         "chat_completion_cost",
         record,
-        &request_id,
         &cost_usd,
         Arc::clone(&state.pool),
         Arc::clone(&state.redis_pool),
